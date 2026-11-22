@@ -160,6 +160,8 @@ void loop_gate(const float* x, const float* m, const float* D, const float* F, c
 /// (F32).  scratch: cand_scratch(n) ints.
 size_t cand_scratch(int n);
 void cand_topk(const float* x, int n, float lo, float hi, int K, int cap, int* scratch, int* out, cudaStream_t s);
+void cand_topk_softcap_rows(const float* x, int ld, int T, int n, float logit_cap, int K, int cap_out, int* scratch,
+                            int* out, int out_stride, cudaStream_t s);
 /// The same gate over a chunk of tokens with its products taken as matrix products by the caller (loop_gates'
 /// kernels are a token's): loop_gate_mix gives g [T][R] = a1 / rms(x) + a2 / rms(m) of a1 = x D_x^T, a2 = m D_m^T
 /// ([T][R]); loop_gate_blend y = (1 - tanh f) x + tanh(gn) m of f = g F, gn = g G ([T][C]; n = T C; y may be x).
@@ -297,8 +299,12 @@ struct MvAlt {
     const float* x = nullptr;
     int r0 = 0, n = 0;
 };
+struct MvAlt16 {
+    const uint16_t* x = nullptr;
+    int r0 = 0, n = 0;
+};
 void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x, int T, float* y, int ldy,
-             cudaStream_t s);
+             cudaStream_t s, const MvAlt16& a0 = MvAlt16{}, const MvAlt16& a1 = MvAlt16{});
 void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
                  const MvConv& c1, cudaStream_t s, const MvAlt& a0 = MvAlt{}, const MvAlt& a1 = MvAlt{});
 void decode_q8p_f16(const int8_t* q, const uint16_t* d, size_t n, uint16_t* out, cudaStream_t s);
@@ -384,6 +390,13 @@ void draft_attn(const float* q, const float* kc, const float* vc, int k_lo, int 
 void draft_attn_f16(const float* q, const uint16_t* kc, const uint16_t* vc, int k_lo, int k_hi, const float* kb,
                     const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s,
                     int cap);
+/// Graph-capturable variants reading k_hi from device pointer pos_d (k_lo = max(0, k_hi - win)) with fixed S splits.
+void draft_attn_at(const float* q, const float* kc, const float* vc, const int* pos_d, int win, int S, const float* kb,
+                   const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s,
+                   int cap);
+void draft_attn_f16_at(const float* q, const uint16_t* kc, const uint16_t* vc, const int* pos_d, int win, int S,
+                       const float* kb, const float* vb, int nq, int H, int Hkv, float scale, float* scratch,
+                       float* out, cudaStream_t s, int cap);
 /// out [T][F] BF16 = silu(gu[t][f]) * gu[t][F + f] (gu [T][2 F] F32: gate's then up's).
 void silu_mul_bf16(const float* gu, int T, int F, uint16_t* out, cudaStream_t s);
 /// The Markov head's input [state (R); emb[prev] (R, BF16 table); hidden (C); f (C)] as BF16 into out [2 R + 2 C].
@@ -434,6 +447,27 @@ size_t attn_block_scratch(int H, int T, int n_split);
 void conv_block(const float* x, int x_ld, float* hist, const float* w, const float* dyn, int d_ld, int heads, int T,
                 int C, const float* res, int res_ld, float* y, int y_ld, float* rec_old, float* rec_x,
                 cudaStream_t s);
+/// Two independent conv_block ops (K and V) in one launch.
+void conv_block_kv(const float* x0, int x0_ld, float* hist0, const float* w0, const float* dyn0, int d0_ld, int heads0,
+                   float* y0, int y0_ld, float* rec_old0, float* rec_x0,
+                   const float* x1, int x1_ld, float* hist1, const float* w1, const float* dyn1, int d1_ld, int heads1,
+                   float* y1, int y1_ld, float* rec_old1, float* rec_x1, int T, int C, cudaStream_t s);
+/// Multi-vector RMS norm for T rows each writing both FP16 and FP32 outputs in one launch (n <= 3).
+struct RmsF16Jobs {
+    const float* x[3];
+    const float* w[3];
+    uint16_t* y16[3];
+    float* y32[3];
+};
+void rms_multi_f16(const RmsF16Jobs& jobs, int n, int T, int D, float eps, cudaStream_t s);
+/// Fused route_rows + group_route + optional f16_limbs_rows in one launch for a block window (T * K <= 64, E <= 128).
+void route_group_block(const float* logits, const float* bias, int T, int E, int K, float scale,
+                       const uint8_t* const* tab, const float* sg_t, const float* su_t, const float* sd_t,
+                       const uint8_t** blob, int* n, int* tok, int* row, float* sg, float* su, float* wt, int* inv,
+                       const float* x, int width, uint16_t* x_limbs, cudaStream_t s);
+/// Fused moe_combine_f32 + conv_block (with residual add and rollback recording) in one launch for T <= 8.
+void moe_combine_conv_block(const float* y, const int* inv, const float* wt, int T, int K, int C, float* hist,
+                            const float* w, const float* res, float* out, float* rec_old, float* rec_x, cudaStream_t s);
 /// A conv's record of a window (conv_block's rec_old, rec_x) and its history.
 struct ConvRec {
     const float* old;
