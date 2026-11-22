@@ -2698,6 +2698,7 @@ Engine flags: `--max-context N` (262144), `--cache-gb N` (60: the expert cache's
 | `IK2_SUP` | 16384 (4096 when VRAM is short) | the tokens of one layer-major prompt pass (each pass copies every expert it misses once); a pass's scratch (~280 KB a token) comes out of the expert cache |
 | `IK2_PF_P` | `0.999` | the prompt prefetch: an expert is copied ahead when the chance that some token of the layer picks it is at least this |
 | `IK2_WGMMA` | on | `0`: the mma.sync attention on Hopper too (the wgmma one needs a build with sm_90a) |
+| `IK2_FA_WMMA` | on | `0`: the flash-attention kernels' QK^T and PV products emulated (m16n8k16 by shuffles) instead of on the gfx12 matrix core — the A/B instrument for the RDNA4 WMMA path; on an arch without a matrix core both arms are the same code |
 | `IK2_ALLOC` | mmap + register | `hostalloc`: the experts' host memory by `cudaHostAlloc`, which pins ~3 GiB/s (load 110-190 s instead of ~50-75 s) |
 | `IK2_HOST` | pinned; `mmap` when every expert stays in VRAM | `mmap`: the experts read through the page cache instead of pinned (for a host without the RAM: unusably slow from network storage, 0.34 tok/s). With every expert in VRAM they are copied there straight from the mapped files and no pinned copy is kept (Inkling-2-Mini loads in 3 s from the page cache) |
 | `IK2_FAST` | on when every expert fits in VRAM | the resident token path (docs/INKLING2.md 8): every expert in VRAM, a token's launches with nothing from the host between its embedding and its logits. `0`: tokens take the cache path |

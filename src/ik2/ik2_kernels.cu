@@ -893,11 +893,22 @@ __global__ void attn_probs_bias_f16_kernel(const float* lg, uint16_t* out16, int
 constexpr int kFaBN = 64, kFaD = 128, kFaLd = kFaD + 8;   // (row pad: conflict-free fragments/ldmatrix)
 constexpr float kLog2e = 1.4426950408889634f;
 
+#if !defined(__HIP_PLATFORM_AMD__)
 __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
                  "{%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+// (the flash-attention kernels' IK2_FA_WMMA=0 arm: on a non-AMD build the instruction IS the mma.sync, so the
+//  emulated name is the same product)
+__device__ __forceinline__ void mma16816_emu(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    mma16816(c, a, b0, b1);
+}
+__device__ __forceinline__ void mma16816x2_emu(float* c0, float* c1, const uint32_t* a, uint32_t b0, uint32_t b1,
+                                               uint32_t b2, uint32_t b3) {
+    mma16816(c0, a, b0, b1);
+    mma16816(c1, a, b2, b3);
 }
 __device__ __forceinline__ void ldsm_x4_t(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* p) {
     const unsigned a = (unsigned) __cvta_generic_to_shared(p);
@@ -926,6 +937,228 @@ template <int N>
 __device__ __forceinline__ void cp_async_wait() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
+#else   // (!__HIP_PLATFORM_AMD__: gfx12, the same operations without PTX)
+// mma.sync m16n8k16's fragment layout is kept exactly, so every kernel that builds fragments is unchanged: a
+// lane's group g = lane >> 2 and tig t = lane & 3 hold rows g and g + 8, columns 2 t and 2 t + 1 of the 16 x 8
+// result; A's a[0..3] are A[g][2t, 2t+1], A[g+8][2t, 2t+1], A[g][2t+8, 2t+9], A[g+8][2t+8, 2t+9]; B's b0, b1
+// are B[2t, 2t+1][g] and B[2t+8, 2t+9][g].
+// P3-4: on gfx12 (RDNA4) the arithmetic is the matrix core: v_wmma_f32_16x16x16_f16_w32_gfx12, llvm's
+// __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12 (wave32; the plain ..._w32 builtin is gfx11's, needs
+// wmma-256b-insts and does not exist on gfx1201).  The instruction is 16 x 16 x 16 - N = 16, not CUDA's 8 - so
+// its two 16 x 8 halves are the two m16n8k16 n8 blocks: one instruction takes the B fragments of both, and its
+// accumulator splits back into the caller's two c[4] sets.  An operand is 8 halves a lane (4 dwords), the
+// accumulator 8 F32 a lane, and the hardware's distribution is (verified on gfx1201, and the layout of the
+// repo's other gfx12 WMMA kernels - src/ds4/ds4_kernels.cu, src/kernels/cuda/exl3.cu):
+//     operand A (M x K = 16 x 16): lane l holds A[l % 16][8 (l >> 4) .. + 7]      (one row, 8 of the 16 k)
+//     operand B (K x N = 16 x 16): lane l holds B[8 (l >> 4) .. + 7][l % 16]      (one column, 8 of the 16 k)
+//     accumulator D:                lane l holds D[8 (l >> 4) + i][l % 16], i = 0..7
+// i.e. a lane owns one column of the result, 8 rows of it.  m16n8k16's lane owns 2 rows x 2 columns per n8
+// block instead, so the two distributions are not a permutation of each other: the accumulator has to be
+// re-laid.  Doing that on the product of two n8 blocks costs 8 shuffles per lane (below); doing it per n8 block
+// costs the same 8 (a shuffle carries one register to every lane at once), which is why the callers that have
+// two neighbouring n8 blocks of one A - mma16816x2 - should use it.
+//
+// The re-lay is cheapest with the product TRANSPOSED, which is what this does: with C = A (16 queries x 16 k) x
+// B (16 k x 8 keys), feed the hardware X = B^T (keys x k, the caller's b0, b1) as its A and Y = A^T (k x
+// queries, the caller's a[0..3]) as its B.  Then C' = X Y = (A B)^T = C^T, so the accumulator holds
+//     lane l, register i  =  C'[8 (l >> 4) + i][l % 16]  =  C[query l % 16][key 8 (l >> 4) + i]
+// - one query a lane, 8 keys of it in registers - and the caller's lane 4 g + t needs queries {g, g + 8} at
+// keys {2t, 2t + 1} (and {2t + 8, 2t + 9} for the second n8 block), which are 4 shuffles from lanes g and g + 8
+// (16 + g, 24 + g) of registers 2t, 2t + 1: the lane keeps only the shuffles whose register is its own key.
+// The dot products are the same 16 products either way round (A^T B^T = (B A)^T, and a product of FP16 values
+// is exact in FP32), so the arithmetic is the CUDA path's up to the summation order.
+//
+// The accumulation is done in the caller's layout (+= below, the instruction run with a zero accumulator):
+// carrying the accumulator across calls in the hardware's layout would need the inverse re-lay on entry, 4 more
+// shuffles a call for the same sums.
+//
+// IK2_FA_WMMA: the flash-attention kernels pick their product at run time (the matrix core by default, the
+// emulation below with 0), so the emulation is defined on every AMD arch - gfx12 included, where the rest of the
+// engine's MMA stays on the core - and mma16816 / mma16816x2 are the core's on gfx12, the emulation's elsewhere.
+__device__ __forceinline__ void mma16816_emu(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    const unsigned lane = threadIdx.x & 31u, g = lane >> 2, t = lane & 3;
+    const int ra = (int) (g * 4), cb0 = (int) (2 * t) * 4, cb1 = cb0 + 4;
+    float d0 = c[0], d1 = c[1], d2 = c[2], d3 = c[3];
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        const uint32_t ar0 = __shfl_sync(0xffffffffu, a[0], ra + u);   // A[g][2u], A[g][2u + 1]
+        const uint32_t ar1 = __shfl_sync(0xffffffffu, a[1], ra + u);   // A[g + 8][2u], [2u + 1]
+        const uint32_t ar2 = __shfl_sync(0xffffffffu, a[2], ra + u);   // A[g][2u + 8], [2u + 9]
+        const uint32_t ar3 = __shfl_sync(0xffffffffu, a[3], ra + u);   // A[g + 8][2u + 8], [2u + 9]
+        const uint32_t b00 = __shfl_sync(0xffffffffu, b0, cb0 + u);    // B[2u, 2u + 1][2t]
+        const uint32_t b01 = __shfl_sync(0xffffffffu, b1, cb0 + u);    // B[2u + 8, 2u + 9][2t]
+        const uint32_t b10 = __shfl_sync(0xffffffffu, b0, cb1 + u);    // ... the column 2t + 1
+        const uint32_t b11 = __shfl_sync(0xffffffffu, b1, cb1 + u);
+        d0 = fmaf(h2f((uint16_t) ar0), h2f((uint16_t) b00), d0);
+        d0 = fmaf(h2f((uint16_t) (ar0 >> 16)), h2f((uint16_t) (b00 >> 16)), d0);
+        d0 = fmaf(h2f((uint16_t) ar2), h2f((uint16_t) b01), d0);
+        d0 = fmaf(h2f((uint16_t) (ar2 >> 16)), h2f((uint16_t) (b01 >> 16)), d0);
+        d1 = fmaf(h2f((uint16_t) ar0), h2f((uint16_t) b10), d1);
+        d1 = fmaf(h2f((uint16_t) (ar0 >> 16)), h2f((uint16_t) (b10 >> 16)), d1);
+        d1 = fmaf(h2f((uint16_t) ar2), h2f((uint16_t) b11), d1);
+        d1 = fmaf(h2f((uint16_t) (ar2 >> 16)), h2f((uint16_t) (b11 >> 16)), d1);
+        d2 = fmaf(h2f((uint16_t) ar1), h2f((uint16_t) b00), d2);
+        d2 = fmaf(h2f((uint16_t) (ar1 >> 16)), h2f((uint16_t) (b00 >> 16)), d2);
+        d2 = fmaf(h2f((uint16_t) ar3), h2f((uint16_t) b01), d2);
+        d2 = fmaf(h2f((uint16_t) (ar3 >> 16)), h2f((uint16_t) (b01 >> 16)), d2);
+        d3 = fmaf(h2f((uint16_t) ar1), h2f((uint16_t) b10), d3);
+        d3 = fmaf(h2f((uint16_t) (ar1 >> 16)), h2f((uint16_t) (b10 >> 16)), d3);
+        d3 = fmaf(h2f((uint16_t) ar3), h2f((uint16_t) b11), d3);
+        d3 = fmaf(h2f((uint16_t) (ar3 >> 16)), h2f((uint16_t) (b11 >> 16)), d3);
+    }
+    c[0] = d0, c[1] = d1, c[2] = d2, c[3] = d3;
+}
+__device__ __forceinline__ void mma16816x2_emu(float* c0, float* c1, const uint32_t* a, uint32_t b0, uint32_t b1,
+                                               uint32_t b2, uint32_t b3) {
+    mma16816_emu(c0, a, b0, b1);
+    mma16816_emu(c1, a, b2, b3);
+}
+#if defined(__gfx1200__) || defined(__gfx1201__)
+typedef _Float16 ik2_wmma_h8 __attribute__((ext_vector_type(8)));
+typedef float ik2_wmma_f8 __attribute__((ext_vector_type(8)));
+struct ik2_wmma_frag {   // (a 16 x 16 operand: 8 halves a lane)
+    uint32_t v[4];
+};
+// A's m16n8k16 fragment -> the hardware's B operand of the transposed product: lane l holds
+// A[query l % 16][k 8 (l >> 4) .. + 7], whose four dwords are a[0], a[1] (k 0..7) or a[2], a[3] (k 8..15) of the
+// four lanes 4 (l % 8) + j (rows 8 and up live in a[1], a[3] of the lane's group).
+__device__ __forceinline__ ik2_wmma_frag wmma_y_from_a(const uint32_t* a) {
+    const unsigned lane = threadIdx.x & 31u, r = lane & 15u, h = lane >> 4, m = r & 7u, lo = r < 8 ? 1u : 0u;
+    ik2_wmma_frag q;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int s = (int) (4 * m + (unsigned) j);
+        const uint32_t v0 = __shfl_sync(0xffffffffu, a[0], s);   // A[r][2j, 2j + 1]
+        const uint32_t v1 = __shfl_sync(0xffffffffu, a[1], s);   // A[r + 8][2j, 2j + 1]
+        const uint32_t v2 = __shfl_sync(0xffffffffu, a[2], s);   // A[r][2j + 8, 2j + 9]
+        const uint32_t v3 = __shfl_sync(0xffffffffu, a[3], s);
+        q.v[j] = h ? (lo ? v2 : v3) : (lo ? v0 : v1);
+    }
+    return q;
+}
+// B's two m16n8k16 fragments (the n8 blocks at keys 0..7 and 8..15) -> the hardware's A operand: lane l holds
+// B[k 8 (l >> 4) .. + 7][key l % 16], from b0, b1 (keys < 8) or b2, b3 (keys 8 and up) of the four lanes
+// 4 (l % 8) + j - a shuffle's source is one lane for every reader, so the key's half is chosen per reader.
+__device__ __forceinline__ ik2_wmma_frag wmma_x_from_b(uint32_t b0, uint32_t b1, uint32_t b2, uint32_t b3) {
+    const unsigned lane = threadIdx.x & 31u, c = lane & 15u, h = lane >> 4, lo = c < 8 ? 1u : 0u;
+    ik2_wmma_frag q;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int s = (int) (4 * (c & 7u) + (unsigned) j);
+        const uint32_t v0 = __shfl_sync(0xffffffffu, b0, s);   // B[2j, 2j + 1][key]
+        const uint32_t v1 = __shfl_sync(0xffffffffu, b1, s);   // B[2j + 8, 2j + 9][key]
+        const uint32_t v2 = __shfl_sync(0xffffffffu, b2, s);   // ... [key + 8]
+        const uint32_t v3 = __shfl_sync(0xffffffffu, b3, s);
+        q.v[j] = h ? (lo ? v1 : v3) : (lo ? v0 : v2);
+    }
+    return q;
+}
+// D (the transposed product) -> the caller's n8 c fragments: c0 = {C[g][2t], C[g][2t+1], C[g+8][2t],
+// C[g+8][2t+1]}, c1 the same at keys 2t + 8, 2t + 9 (lanes g + 16, g + 24).  A shuffle carries one register,
+// so the loop is over the key (the register) and each lane keeps the two that are its own t's.
+template <bool BOTH>
+__device__ __forceinline__ void wmma_c_into(float* c0, float* c1, const ik2_wmma_f8& d, bool add) {
+    const unsigned lane = threadIdx.x & 31u, g = lane >> 2, t = lane & 3u;
+    const int j0 = 2 * (int) t, s0 = (int) g, s1 = (int) g + 8, s2 = (int) g + 16, s3 = (int) g + 24;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float v0 = __shfl_sync(0xffffffffu, d[j], s0), v1 = __shfl_sync(0xffffffffu, d[j], s1);
+        if (j == j0) c0[0] = add ? c0[0] + v0 : v0, c0[2] = add ? c0[2] + v1 : v1;
+        if (j == j0 + 1) c0[1] = add ? c0[1] + v0 : v0, c0[3] = add ? c0[3] + v1 : v1;
+        if constexpr (BOTH) {
+            const float v2 = __shfl_sync(0xffffffffu, d[j], s2), v3 = __shfl_sync(0xffffffffu, d[j], s3);
+            if (j == j0) c1[0] = add ? c1[0] + v2 : v2, c1[2] = add ? c1[2] + v3 : v3;
+            if (j == j0 + 1) c1[1] = add ? c1[1] + v2 : v2, c1[3] = add ? c1[3] + v3 : v3;
+        }
+    }
+}
+__device__ __forceinline__ ik2_wmma_f8 wmma_run(const ik2_wmma_frag& x, const ik2_wmma_frag& y,
+                                                const ik2_wmma_f8& acc) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(__builtin_bit_cast(ik2_wmma_h8, x),
+                                                            __builtin_bit_cast(ik2_wmma_h8, y), acc);
+}
+__device__ __forceinline__ ik2_wmma_f8 wmma_run(const ik2_wmma_frag& x, const ik2_wmma_frag& y) {
+    ik2_wmma_f8 z;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) z[i] = 0.0f;
+    return wmma_run(x, y, z);
+}
+// D[16 x 8] (+)= A[16 x 16] x B[16 x 8], the m16n8k16 of the CUDA branch, through the matrix core
+__device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    const ik2_wmma_f8 d = wmma_run(wmma_x_from_b(b0, b1, 0u, 0u), wmma_y_from_a(a));
+    wmma_c_into<false>(c, c, d, true);
+}
+// the same for both n8 blocks of one A in one instruction: D[16 x 16] (+)= A x B (b2, b3: keys 8..15)
+__device__ __forceinline__ void mma16816x2(float* c0, float* c1, const uint32_t* a, uint32_t b0, uint32_t b1,
+                                           uint32_t b2, uint32_t b3) {
+    wmma_c_into<true>(c0, c1, wmma_run(wmma_x_from_b(b0, b1, b2, b3), wmma_y_from_a(a)), true);
+}
+#else   // (not gfx12: the emulation, defined above so the gate's off arm is the same code on every arch)
+__device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    mma16816_emu(c, a, b0, b1);
+}
+__device__ __forceinline__ void mma16816x2(float* c0, float* c1, const uint32_t* a, uint32_t b0, uint32_t b1,
+                                           uint32_t b2, uint32_t b3) {
+    mma16816x2_emu(c0, c1, a, b0, b1, b2, b3);
+}
+#endif   // (__gfx1200__ / __gfx1201__: the matrix core; anything else: the emulation)
+// IK2_FA_WMMA's product for the flash-attention kernels: W = the arch's own (the gfx12 matrix core, or the CUDA
+// mma.sync), else the emulated m16n8k16.  Both are the same sums (FP16 products exact in FP32), so the two arms
+// differ in summation order only - the parity harness is what says so.
+template <bool W>
+__device__ __forceinline__ void fa_mma(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    if constexpr (W) mma16816(c, a, b0, b1);
+    else mma16816_emu(c, a, b0, b1);
+}
+template <bool W>
+__device__ __forceinline__ void fa_mma2(float* c0, float* c1, const uint32_t* a, uint32_t b0, uint32_t b1,
+                                        uint32_t b2, uint32_t b3) {
+    if constexpr (W) mma16816x2(c0, c1, a, b0, b1, b2, b3);
+    else mma16816x2_emu(c0, c1, a, b0, b1, b2, b3);
+}
+// ldmatrix's addressing, read as shared memory is: a lane's address is the start of one row of an 8 x 8 block
+// (lanes 0-7: block 0's rows 0-7, 8-15: block 1's, ...), and the fragment a lane holds is block row lane >> 2,
+// columns 2 (lane & 3) and 2 (lane & 3) + 1.  The row's address is the one its lane passed, gathered by a
+// shuffle - no shared-memory descriptor, so no __cvta_generic_to_shared and no swizzle to undo.
+__device__ __forceinline__ const uint16_t* ldsm_row(const void* p, int src) {
+    const uint32_t lo = (uint32_t) (uintptr_t) p, hi = (uint32_t) ((uint64_t) (uintptr_t) p >> 32);
+    const uint32_t l = __shfl_sync(0xffffffffu, lo, src), h = __shfl_sync(0xffffffffu, hi, src);
+    return (const uint16_t*) (uintptr_t) (((uint64_t) h << 32) | l);
+}
+__device__ __forceinline__ void ldsm_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* p) {
+    const unsigned lane = threadIdx.x & 31u, row = lane >> 2, col = (lane & 3u) * 2u;
+    r0 = *(const uint32_t*) (ldsm_row(p, (int) row) + col);
+    r1 = *(const uint32_t*) (ldsm_row(p, 8 + (int) row) + col);
+    r2 = *(const uint32_t*) (ldsm_row(p, 16 + (int) row) + col);
+    r3 = *(const uint32_t*) (ldsm_row(p, 24 + (int) row) + col);
+}
+__device__ __forceinline__ void ldsm_x4_t(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* p) {
+    const unsigned lane = threadIdx.x & 31u, row = lane >> 2, col = (lane & 3u) * 2u;
+    // transposed: a lane holds block rows 2 (lane & 3) and 2 (lane & 3) + 1 at the column lane >> 2
+    const auto frag = [&](int m) {
+        const uint16_t* a0 = ldsm_row(p, m * 8 + (int) col) + row;
+        const uint16_t* a1 = ldsm_row(p, m * 8 + (int) col + 1) + row;
+        return (uint32_t) a0[0] | ((uint32_t) a1[0] << 16);
+    };
+    r0 = frag(0), r1 = frag(1), r2 = frag(2), r3 = frag(3);
+}
+// cp.async: the copy is made as the instruction is reached - no group is in flight and nothing is waited for;
+// the kernel's own __syncthreads() (and __syncwarp(), for the bias) order it, and commit / wait stay as the
+// compiler's ordering points (valid == false: the bytes zero-filled, as the instruction's 0 source size does).
+__device__ __forceinline__ void cp_async16(void* dst, const void* src, bool valid) {
+    if (valid) *(uint4*) dst = *(const uint4*) src;
+    else *(uint4*) dst = make_uint4(0u, 0u, 0u, 0u);
+}
+__device__ __forceinline__ void cp_async4(void* dst, const void* src, bool valid) {
+    if (valid) *(uint32_t*) dst = *(const uint32_t*) src;
+    else *(uint32_t*) dst = 0u;
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("" ::: "memory"); }
+template <int N>
+__device__ __forceinline__ void cp_async_wait() {
+    __threadfence_block();   // (the copies' shared-memory writes, ordered before what follows)
+}
+#endif
 
 // one 64-key tile of K and V (rows kt .. kt+63; rows at or past k_end zero-filled) into smem, NT threads
 template <int NT>
@@ -1000,13 +1233,41 @@ __device__ __forceinline__ void fa_tile_from_raw(uint16_t* Ks, uint16_t* Vs, con
         *(uint4*) (Vs + row * kFaLd + col) = e4m3x8_h8(v8);
     }
 }
+#if defined(__HIP_PLATFORM_AMD__)
+// A workgroup has 64 KB of shared memory on gfx12: an FP8 tile has no room for its staged bytes as well, so
+// they are turned into FP16 as they are loaded.  The same 8 bytes an iteration as fa_tile_from_raw reads, and
+// the same conversion, so the tile is exactly the one the CUDA path builds.
+template <int NT>
+__device__ __forceinline__ void fa_load_tile_raw_f16(uint16_t* Ks, uint16_t* Vs, const uint8_t* kc,
+                                                     const uint8_t* vc, int kv_cap, int KD, int g, int kt,
+                                                     int k_end, int tid) {
+#pragma unroll
+    for (int it = 0; it < (kFaBN * kFaD / 8) / NT; ++it) {
+        const int c = it * NT + tid, row = c >> 4, col = (c & 15) * 8;
+        const int kp = kt + row;
+        const bool ok = kp < k_end;
+        const int pr = ok ? (kv_cap > 0 ? kp % kv_cap : kp) : 0;
+        const size_t off = (size_t) pr * KD + (size_t) g * kFaD + col;
+        const uint2 k8 = ok ? *(const uint2*) (kc + off) : make_uint2(0u, 0u);
+        const uint2 v8 = ok ? *(const uint2*) (vc + off) : make_uint2(0u, 0u);
+        *(uint4*) (Ks + row * kFaLd + col) = e4m3x8_h8(k8);
+        *(uint4*) (Vs + row * kFaLd + col) = e4m3x8_h8(v8);
+    }
+}
+#endif
 
 // The relative bias: a tile within the extent of a warp's queries has the warp copy its 16 rows x 64 distances of the
 // table into shared memory (cp.async, coalesced, issued before the tile's Q K^T) - loading it element by element at
 // the softmax cost ~3x the whole kernel in the sliding layers (every tile there is within the extent).
 constexpr int kFaBld = 72;   // (a bias row in shared memory; 72: 2-way bank conflicts at most for the float2 reads)
 constexpr int kFaNW = 4;     // warps a block (8: the same speed in a test, and past sm_89/sm_120's shared memory)
-constexpr int kFaSmem = 4 * kFaBN * kFaLd * (int) sizeof(uint16_t) + kFaNW * 16 * kFaBld * (int) sizeof(float);
+#if defined(__HIP_PLATFORM_AMD__)
+constexpr int kFaBufs = 1;   // (gfx12: 64 KB of shared memory a workgroup - one K / V tile buffer, not two: 52 KB)
+#else
+constexpr int kFaBufs = 2;
+#endif
+constexpr int kFaSmem = 2 * kFaBufs * kFaBN * kFaLd * (int) sizeof(uint16_t) +
+                        kFaNW * 16 * kFaBld * (int) sizeof(float);
 // Hopper (sm_90a) warpgroup MMA: the four warps of a 128-thread block as one warpgroup, 64 rows.
 // D[64 x 64] (+)= A[64 x 16] (registers, the mma.m16n8k16 A fragments of each warp's 16 rows) x B (smem
 // descriptor; tnsp: B stored N-major), F16 in, F32 accumulate; d[j * 4 + i] as mma's C fragment of n8 block j
@@ -1058,7 +1319,13 @@ __device__ __forceinline__ void wg_wait0() {
 #endif
 }
 // (keeps the compiler from moving an accumulator's use across the asynchronous MMA's issue or wait)
-__device__ __forceinline__ void wg_fence_operand(float& r) { asm volatile("" : "+f"(r)::"memory"); }
+__device__ __forceinline__ void wg_fence_operand(float& r) {
+#if defined(__HIP_PLATFORM_AMD__)
+    asm volatile("" : "+v"(r)::"memory");   // (a VGPR an empty asm still pins: the sm_90a path's ordering)
+#else
+    asm volatile("" : "+f"(r)::"memory");
+#endif
+}
 __device__ __forceinline__ void fence_proxy_async() {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
@@ -1066,9 +1333,14 @@ __device__ __forceinline__ void fence_proxy_async() {
 }
 // shared-memory matrix descriptor with the 128-byte swizzle: start, leading / stride byte offsets
 __device__ __forceinline__ uint64_t wg_desc(const void* p, uint32_t lbo, uint32_t sbo) {
+#if defined(__HIP_PLATFORM_AMD__)
+    (void) p, (void) lbo, (void) sbo;
+    return 0;   // (a wgmma descriptor is sm_90a's: WG is never launched on gfx12, wgmma_* trap there)
+#else
     const uint32_t a = (uint32_t) __cvta_generic_to_shared(p);
     return (uint64_t) ((a & 0x3FFFF) >> 4) | ((uint64_t) ((lbo & 0x3FFFF) >> 4) << 16) |
            ((uint64_t) ((sbo & 0x3FFFF) >> 4) << 32) | ((uint64_t) 1 << 62);
+#endif
 }
 // A 64 x 128 tile (rows: keys, columns: dims), 1024-byte aligned, in the 128-byte-swizzle layout: two atoms of
 // 64 rows x 64 columns (128 bytes a row), the 16-byte chunks of row r XOR-permuted by r % 8. K is then B K-major
@@ -1093,19 +1365,25 @@ __device__ __forceinline__ void fa_load_tile_wg(uint16_t* Ks, uint16_t* Vs, cons
     }
 }
 
-template <int NW, bool WG, class KVT = uint16_t>   // (KVT: the cache's values, FP16 or FP8 - an FP8 tile's bytes are
-__global__ void __launch_bounds__(NW * 32, 2)        //  made FP16 in shared memory; the warpgroup path is FP16's)
+template <int NW, bool WG, class KVT = uint16_t, bool FAW = true>   // (KVT: the cache's values, FP16 or FP8 - an
+__global__ void __launch_bounds__(NW * 32, 2)        //  FP8 tile's bytes are made FP16 in shared memory; the
+                                                     //  warpgroup path is FP16's; FAW: IK2_FA_WMMA, the QK^T and
+                                                     //  PV products on the gfx12 matrix core or emulated)
 attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __restrict__ kc,
                       const KVT* __restrict__ vc, int kv_cap, int H, int KV, int Tq, int qpos0, float qk_scale,
                       const float* __restrict__ bias, int extent, int window, int n_split, float* __restrict__ o_part,
                       float2* __restrict__ ml_part) {
     extern __shared__ __align__(16) uint16_t fa_sm[];
     constexpr bool F8 = sizeof(KVT) == 1;        // (FP8: one FP16 tile, and the bytes of two [2][kFaRaw] after it)
-    uint16_t* Ks = fa_sm;                        // [2][kFaBN][kFaLd]
-    uint16_t* Vs = fa_sm + (F8 ? 1 : 2) * kFaBN * kFaLd;   // [2][kFaBN][kFaLd]
+    uint16_t* Ks = fa_sm;                        // [kFaBufs][kFaBN][kFaLd]
+    uint16_t* Vs = fa_sm + (F8 ? 1 : kFaBufs) * kFaBN * kFaLd;   // [kFaBufs][kFaBN][kFaLd]
     uint8_t* Rs = (uint8_t*) (fa_sm + 2 * kFaBN * kFaLd);
+#if defined(__HIP_PLATFORM_AMD__)
+    constexpr int kTileLd = 0;   // (one buffer: K and V are their own buffer)
+#else
     constexpr int kTileLd = WG ? kWgTile : F8 ? 0 : kFaBN * kFaLd;   // (halves from one buffer to the other)
-    float* Bw = (float*) (fa_sm + 4 * kFaBN * kFaLd) + (threadIdx.x >> 5) * 16 * kFaBld;   // this warp's [16][kFaBld]
+#endif
+    float* Bw = (float*) (fa_sm + 2 * kFaBufs * kFaBN * kFaLd) + (threadIdx.x >> 5) * 16 * kFaBld;   // this warp's [16][kFaBld]
     if constexpr (WG) {   // [2][kWgTile] each, 1024-byte aligned (the swizzle's atoms), inside the same 68 KB
         uint16_t* a = (uint16_t*) (((uintptr_t) fa_sm + 1023) & ~(uintptr_t) 1023);
         Ks = a, Vs = a + 2 * kWgTile;
@@ -1126,6 +1404,24 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
     const int wi = i0 + warp * 16;
     const int ia = wi + gr, ib = wi + gr + 8;
     const int qa = qpos0 + ia, qb = qpos0 + ib;
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    // P3-4: the query as the matrix core's native B operand - lane l holds query l % 16's 8 dims of a k-step
+    // (dim 8 (l >> 4) .. + 7), one 16-byte read a k-step, built once for the whole kernel.  (qf, the m16n8k16
+    // fragments of the other paths, feeds the IK2_FA_WMMA=0 arm; with the gate on it is dead on gfx12 and the
+    // loads go with it.)
+    ik2_wmma_frag qn[kFaD / 16];
+    {
+        const uint16_t* qr = q16 + (size_t) (wi + (lane & 15)) * q_ld + (size_t) h * kFaD + 8 * (lane >> 4);
+        const bool ok = wi + (lane & 15) < Tq;
+#pragma unroll
+        for (int kk = 0; kk < kFaD / 16; ++kk) {
+            qn[kk].v[0] = ok ? *(const uint32_t*) (qr + kk * 16) : 0u;
+            qn[kk].v[1] = ok ? *(const uint32_t*) (qr + kk * 16 + 2) : 0u;
+            qn[kk].v[2] = ok ? *(const uint32_t*) (qr + kk * 16 + 4) : 0u;
+            qn[kk].v[3] = ok ? *(const uint32_t*) (qr + kk * 16 + 6) : 0u;
+        }
+    }
+#endif
     uint32_t qf[kFaD / 16][4];
     {
         const uint16_t* qra = q16 + (size_t) ia * q_ld + (size_t) h * kFaD;
@@ -1146,14 +1442,20 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
     const float sc = qk_scale * kLog2e;
     const int lo_a = qa - window + 1, lo_b = qb - window + 1;
 
+#if defined(__HIP_PLATFORM_AMD__)
+    // (gfx12: one tile buffer - 64 KB of shared memory a workgroup - so each tile is copied at the top of its
+    //  own iteration instead of a tile ahead: see the loop's load, after the barrier that ends the tile before's
+    //  reads of the buffer.)
+#else
     if (t0 < t1) {
         if constexpr (WG) fa_load_tile_wg<NW * 32>(Ks, Vs, kc, vc, kv_cap, KD, g, k_lo + t0 * kFaBN, k_hi, tid);
         else if constexpr (F8) fa_load_tile_raw<NW * 32>(Rs, kc, vc, kv_cap, KD, g, k_lo + t0 * kFaBN, k_hi, tid);
         else fa_load_tile<NW * 32>(Ks, Vs, kc, vc, kv_cap, KD, g, k_lo + t0 * kFaBN, k_hi, tid);
         cp_async_commit();
     }
+#endif
     for (int t = t0; t < t1; ++t) {
-        const int buf = (t - t0) & 1;
+        const int buf = (t - t0) & (kFaBufs - 1);   // (gfx12 buffers one tile, so this stays 0 - see kFaBufs)
         const int kt = k_lo + t * kFaBN;
         // does this warp's rows see any key of the tile, and is any distance within the bias's extent?
         const bool any = !(kt > qpos0 + wi + 15 || kt + kFaBN - 1 < qpos0 + wi - window + 1) && wi < Tq;
@@ -1173,6 +1475,7 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
             }
         }
         cp_async_commit();
+#if !defined(__HIP_PLATFORM_AMD__)
         if (t + 1 < t1) {
             if constexpr (WG)
                 fa_load_tile_wg<NW * 32>(Ks + (buf ^ 1) * kTileLd, Vs + (buf ^ 1) * kTileLd, kc, vc, kv_cap,
@@ -1184,14 +1487,24 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
                 fa_load_tile<NW * 32>(Ks + (buf ^ 1) * kFaBN * kFaLd, Vs + (buf ^ 1) * kFaBN * kFaLd, kc, vc, kv_cap,
                                       KD, g, k_lo + (t + 1) * kFaBN, k_hi, tid);
         }
+#endif
         cp_async_commit();
         cp_async_wait<2>();
         if constexpr (WG) fence_proxy_async();   // (the copies visible to the MMA's reads of shared memory)
         __syncthreads();
+#if defined(__HIP_PLATFORM_AMD__)
+        // (the tile, into the one buffer - after the barrier, so no warp is still reading the tile before's - and
+        //  a barrier again, so it is every warp's.  kt, k_hi: this tile's keys, rows past k_end zero-filled.)
+        if constexpr (WG) fa_load_tile_wg<NW * 32>(Ks, Vs, kc, vc, kv_cap, KD, g, kt, k_hi, tid);
+        else if constexpr (F8) fa_load_tile_raw_f16<NW * 32>(Ks, Vs, kc, vc, kv_cap, KD, g, kt, k_hi, tid);
+        else fa_load_tile<NW * 32>(Ks, Vs, kc, vc, kv_cap, KD, g, kt, k_hi, tid);
+        __syncthreads();
+#else
         if constexpr (F8) {   // (the tile's bytes are in: FP16 of them)
             fa_tile_from_raw<NW * 32>(Ks, Vs, Rs + buf * kFaRaw, tid);
             __syncthreads();
         }
+#endif
         const uint16_t* K = Ks + buf * kTileLd;
         const uint16_t* V = Vs + buf * kTileLd;
         if (any || WG) {   // (the warpgroup's MMA takes all four warps)
@@ -1211,17 +1524,46 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
 #pragma unroll
                 for (int j = 0; j < kFaBN / 8; ++j)
                     for (int e = 0; e < 4; ++e) wg_fence_operand(s[j][e]);
-            } else
+            }
+#if defined(__gfx1200__) || defined(__gfx1201__)
+            else if constexpr (FAW) {
+                // P3-4: the 16 x 16 x 16 product straight from the tile: no ldmatrix, no shuffles - K's native A
+                // operand is one 16-byte load a lane (row = key, columns = 8 of the head's 16 dims a k-step), the
+                // query is the native B operand (built once, qn), and the 8 k-steps accumulate in the matrix core's
+                // own layout (lane = query, registers = keys).  The product is re-laid into the m16n8k16 fragments
+                // the softmax reads once a key group of 16 - 4 times a tile, not once a k-step - which is why this
+                // path is worth its shuffles: 32 a tile against the emulation's 96 a tile's worth of MMA.
+                ik2_wmma_f8 sn[kFaBN / 16];
 #pragma unroll
-            for (int j = 0; j < kFaBN / 8; ++j) {
-                s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.0f;
-                const uint16_t* kr = K + (j * 8 + (lane & 7)) * kFaLd + (lane >> 3) * 8;   // (two k-steps an ldmatrix)
+                for (int j = 0; j < kFaBN / 16; ++j) {
 #pragma unroll
-                for (int kk = 0; kk < kFaD / 16; kk += 2) {
-                    uint32_t b0, b1, b2, b3;
-                    ldsm_x4(b0, b1, b2, b3, kr + kk * 16);
-                    mma16816(s[j], qf[kk], b0, b1);
-                    mma16816(s[j], qf[kk + 1], b2, b3);
+                    for (int i = 0; i < 8; ++i) sn[j][i] = 0.0f;
+                    const uint16_t* kr = K + (j * 16 + (lane & 15)) * kFaLd + 8 * (lane >> 4);
+#pragma unroll
+                    for (int kk = 0; kk < kFaD / 16; ++kk) {
+                        const uint4 kv = *(const uint4*) (kr + kk * 16);
+                        ik2_wmma_frag x;
+                        x.v[0] = kv.x, x.v[1] = kv.y, x.v[2] = kv.z, x.v[3] = kv.w;
+                        sn[j] = wmma_run(x, qn[kk], sn[j]);
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < kFaBN / 16; ++j)
+                    wmma_c_into<true>(&s[2 * j][0], &s[2 * j + 1][0], sn[j], false);
+            }
+#endif   // (gfx12: the native A operand, the IK2_FA_WMMA=0 arm's ldmatrix fragments below)
+            else {   // (the emulation - the other arches' path, and gfx12's IK2_FA_WMMA=0 arm)
+#pragma unroll
+                for (int j = 0; j < kFaBN / 8; ++j) {
+                    s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.0f;
+                    const uint16_t* kr = K + (j * 8 + (lane & 7)) * kFaLd + (lane >> 3) * 8;   // (two k-steps an ldmatrix)
+#pragma unroll
+                    for (int kk = 0; kk < kFaD / 16; kk += 2) {
+                        uint32_t b0, b1, b2, b3;
+                        ldsm_x4(b0, b1, b2, b3, kr + kk * 16);
+                        fa_mma<FAW>(s[j], qf[kk], b0, b1);
+                        fa_mma<FAW>(s[j], qf[kk + 1], b2, b3);
+                    }
                 }
             }
             // logits (log2 units): scale, bias, mask - a tile inside every row's keys and past the bias's extent
@@ -1304,8 +1646,7 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
                     for (int j = 0; j < kFaD / 8; j += 2) {
                         uint32_t b0, b1, b2, b3;
                         ldsm_x4_t(b0, b1, b2, b3, vr + j * 8);
-                        mma16816(o[j], pa[kk], b0, b1);
-                        mma16816(o[j + 1], pa[kk], b2, b3);
+                        fa_mma2<FAW>(o[j], o[j + 1], pa[kk], b0, b1, b2, b3);   // (one instruction on gfx12)
                     }
                 }
             }
@@ -1379,7 +1720,7 @@ __device__ __forceinline__ int wa_active(int qpos, int window, int nw, int& k_lo
     return min(nw, (n_steps + kWaMin - 1) / kWaMin);
 }
 
-template <class KVT>
+template <class KVT, bool FAW = true>   // (FAW: IK2_FA_WMMA - the products on the gfx12 matrix core or emulated)
 __global__ void __launch_bounds__(kWaNW * 32, 4)
 attn_decode_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__ kc, const KVT* __restrict__ vc,
                        int kv_cap, int H, int Hkv, const int* pos_d, int qpos, float qk_scale,
@@ -1454,7 +1795,7 @@ attn_decode_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__
                 }
             }
 #pragma unroll
-            for (int kk = 0; kk < kFaD / 16; ++kk) mma16816((kk & 1) ? sb : sa, ka[kk], qf[kk][0], qf[kk][1]);
+            for (int kk = 0; kk < kFaD / 16; ++kk) fa_mma<FAW>((kk & 1) ? sb : sa, ka[kk], qf[kk][0], qf[kk][1]);
         }
         // the logits (log2 units): scale, bias, mask
         const int k0 = kt + gr, k1 = k0 + 8;
@@ -1526,10 +1867,10 @@ attn_decode_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__
                     uint32_t a[4];
                     e4m3x4_h4(__byte_perm(x0[i], x1[i], 0x5140u), a[0], a[1]);
                     e4m3x4_h4(__byte_perm(x8[i], x9[i], 0x5140u), a[2], a[3]);
-                    mma16816(o[2 * i], a, pb0, pb1);
+                    fa_mma<FAW>(o[2 * i], a, pb0, pb1);
                     e4m3x4_h4(__byte_perm(x0[i], x1[i], 0x7362u), a[0], a[1]);
                     e4m3x4_h4(__byte_perm(x8[i], x9[i], 0x7362u), a[2], a[3]);
-                    mma16816(o[2 * i + 1], a, pb0, pb1);
+                    fa_mma<FAW>(o[2 * i + 1], a, pb0, pb1);
                 }
             } else {
 #pragma unroll
@@ -1542,7 +1883,7 @@ attn_decode_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__
                     for (int jj = 0; jj < 4; ++jj) {
                         const uint32_t a[4] = {__byte_perm(x0[jj], x1[jj], 0x5410u), __byte_perm(x0[jj], x1[jj], 0x7632u),
                                                __byte_perm(x8[jj], x9[jj], 0x5410u), __byte_perm(x8[jj], x9[jj], 0x7632u)};
-                        mma16816(o[4 * i + jj], a, pb0, pb1);
+                        fa_mma<FAW>(o[4 * i + jj], a, pb0, pb1);
                     }
                 }
             }
@@ -2654,23 +2995,47 @@ __global__ void nv_limb_mv(const uint8_t* const* blobs, const NvInput* packed, s
 }
 
 // Each warp multiplies 16 expert rows by the distinct token inputs in its group.
+// FP16x2 arithmetic, round to nearest: the PTX mul.rn / sub.rn.f16x2 on a CUDA build, HIP's own half2
+// operations (the same instruction, v_pk_mul_f16 / v_pk_sub_f16) on gfx12.
+__device__ __forceinline__ uint32_t f16x2_mul_rn(uint32_t a, uint32_t b) {
+#if defined(__HIP_PLATFORM_AMD__)
+    const __half2 x = __halves2half2(__ushort_as_half((uint16_t) (a & 0xFFFFu)),
+                                     __ushort_as_half((uint16_t) (a >> 16)));
+    const __half2 y = __halves2half2(__ushort_as_half((uint16_t) (b & 0xFFFFu)),
+                                     __ushort_as_half((uint16_t) (b >> 16)));
+    const __half2 r = __hmul2(x, y);
+    return (uint32_t) __half_as_ushort(__low2half(r)) | ((uint32_t) __half_as_ushort(__high2half(r)) << 16);
+#else
+    uint32_t r;
+    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+#endif
+}
+__device__ __forceinline__ uint32_t f16x2_sub_rn(uint32_t a, uint32_t b) {
+#if defined(__HIP_PLATFORM_AMD__)
+    const __half2 x = __halves2half2(__ushort_as_half((uint16_t) (a & 0xFFFFu)),
+                                     __ushort_as_half((uint16_t) (a >> 16)));
+    const __half2 y = __halves2half2(__ushort_as_half((uint16_t) (b & 0xFFFFu)),
+                                     __ushort_as_half((uint16_t) (b >> 16)));
+    const __half2 r = __hsub2(x, y);
+    return (uint32_t) __half_as_ushort(__low2half(r)) | ((uint32_t) __half_as_ushort(__high2half(r)) << 16);
+#else
+    uint32_t r;
+    asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+#endif
+}
 __device__ __forceinline__ uint32_t ik2_fp4pair(uint32_t v, uint32_t scale) {
     const uint32_t mag = __byte_perm(0x42403c00u, 0x4a484644u, (v & 0x0707u) << 4);
     const uint32_t sign = ((v & 8u) << 12) | ((v & 0x800u) << 20);
-    uint32_t ret;
-    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(ret) : "r"(mag | sign), "r"(scale));
-    return ret;
+    return f16x2_mul_rn(mag | sign, scale);
 }
 __device__ __forceinline__ uint32_t q8_pair(uint32_t w) {
     const uint32_t u = __byte_perm(w ^ 0x80808080u, 0x64646464u, 0x4140);
-    uint32_t f;
-    asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(f) : "r"(u), "r"(0x64806480u));
-    return f;
+    return f16x2_sub_rn(u, 0x64806480u);
 }
 __device__ __forceinline__ uint32_t q8_h2(uint32_t w, uint32_t scale) {
-    uint32_t f = q8_pair(w);
-    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(f) : "r"(f), "r"(scale));
-    return f;
+    return f16x2_mul_rn(q8_pair(w), scale);
 }
 
 template <bool Gate, int Splits, bool Q8 = false>
@@ -2788,9 +3153,7 @@ __device__ __forceinline__ uint32_t ue4m3_h2(uint32_t x) {   // FP16 bits of ue4
 __device__ __forceinline__ uint32_t nv_pair_h2(uint32_t s, uint32_t scale) {   // bytes 0 and 1's low nibbles
     const uint32_t mag = __byte_perm(0x42403c00u, 0x4a484644u, (s & 0x0707u) << 4);
     const uint32_t sign = ((s & 0x0808u) * 0x101000u) & 0x80008000u;
-    uint32_t r;
-    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(mag | sign), "r"(scale));
-    return r;
+    return f16x2_mul_rn(mag | sign, scale);
 }
 struct NvStep {   // a lane's part of a 64-value block of its two rows: the sub-block's scales and codes
     uint32_t sa, sb, wa0, wa1, wb0, wb1;
@@ -2804,6 +3167,209 @@ __device__ __forceinline__ NvStep nv_step_load(const uint8_t* a, const uint8_t* 
     r.wb0 = __ldg(bp + 1 + 2 * t), r.wb1 = __ldg(bp + 2 + 2 * t);
     return r;
 }
+// ---- P3-4: the grouped expert GEMM on gfx12's matrix cores (v_mmac_f32_16x16x16_f16, wave32).  One warp owns
+// a 16-row x 16-column tile - 16 rows of weights and the group's <= 8 token columns (columns 8..15 stay zero and
+// their writes are guarded) - over its stride of the K blocks: one WMMA a 16-value k step in place of each
+// emulated m16n8k16.  The gfx12 register layout (checked on gfx1201 against src/prefill/moe_fused_rdna4.cu's iu8
+// kernels and by a basis probe): lane l holds A[l % 16][8 (l / 16) + j] and B[8 (l / 16) + j][l % 16], and
+// D[8 (l / 16) + i][l % 16].  So a lane reads 8 consecutive k of ONE weight row (its A fragment) and 8 consecutive
+// k of one activation row (its B column, one token) - no shuffles, no shared-memory staging of the operands.
+// Arithmetic identical to the emulated path: an NVFP4 code times its sub-block scale is exact in FP16 and the
+// products are exactly summed in FP32, so only the summation order inside the 16-value dot differs.
+#if defined(__HIP_PLATFORM_AMD__)
+typedef _Float16 ik2_mh8 __attribute__((ext_vector_type(8)));
+typedef float ik2_mf8 __attribute__((ext_vector_type(8)));
+union ik2_mfrag {
+    uint32_t u[4];
+    ik2_mh8 h;
+};
+__device__ __forceinline__ ik2_mf8 ik2_vmmac(ik2_mh8 a, ik2_mh8 b, ik2_mf8 c) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+#else
+    (void) a, (void) b;
+    return c;   // (never launched: the host dispatch checks the device's arch first)
+#endif
+}
+// One 64-value NVFP4 block: 4 bytes of 4 ue4m3 sub-block scales, then 32 bytes of codes.  Sub-block t16 (its
+// scale byte t16) is the 16 values k0 + 16 t16 .. + 15, and its 8 bytes carry value i in byte i's low nibble and
+// value i + 8 in that byte's high nibble.  This lane's 8 consecutive values (k0 + 16 t16 + 8 n .. + 7) are
+// therefore the low nibbles (n = 0) or the high nibbles (n = 1) of that sub-block's 8 bytes, in order.
+__device__ __forceinline__ void ik2_nv_a_frag(ik2_mfrag& A, uint2 q, int n, uint32_t scale) {
+    const uint32_t w[4] = {q.x & 0xFFFFu, q.x >> 16, q.y & 0xFFFFu, q.y >> 16};
+#pragma unroll
+    for (int p = 0; p < 4; ++p) A.u[p] = ik2_fp4pair(n ? (w[p] >> 4) : w[p], scale);
+}
+template <bool Gate>
+__global__ void __launch_bounds__(128)
+grouped_expert_wmma_kernel(const uint8_t* const* __restrict__ blobs, const int* __restrict__ tok, size_t offset,
+                           int C, int F, const uint16_t* __restrict__ h, uint16_t* hidden, float* out,
+                           const float* sg, const float* su, float gcap, float ucap, const int* counts,
+                           const int* rows_out, const uint16_t* input16) {
+    __shared__ float part[4][16 * 16];
+    const int lane = threadIdx.x & 31, split = threadIdx.x >> 5;
+    const int n = lane >> 4, c = lane & 15, rr = lane & 15;
+    const int s = blockIdx.y, count = counts[s];
+    if (count <= 0) return;
+    const int K = Gate ? C : F;
+    const int r0 = Gate ? blockIdx.x * 8 : blockIdx.x * 16;
+    const int stride = K / 64 * 36;
+    // this lane's A row: rows 0..7 are the (gate | down) rows r0.. and 8..15 the up rows (gate) or down r0 + 8..
+    const int arow = Gate ? r0 + (rr & 7) : r0 + rr;
+    const uint8_t* ap = blobs[s] + (Gate ? (rr < 8 ? 0 : offset) : offset) + (size_t) arow * stride;
+    // this lane's B column: the group's token c, zero past the group's count
+    const bool live = c < count;
+    const int xrow = live ? (Gate ? tok[s * kGroupMax + c] : rows_out[s * kGroupMax + c]) : 0;
+    const uint16_t* bp = (Gate ? input16 : h) + (size_t) xrow * K;
+    ik2_mfrag A, B;
+    ik2_mf8 d;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) d[i] = 0.0f;
+    const int nk = K / 64;
+    for (int k = split; k < nk; k += 4) {
+        const uint32_t* sp = (const uint32_t*) ap + (size_t) k * 9;   // (36 bytes = 9 words)
+        const uint32_t s0 = __ldg(sp);
+#pragma unroll
+        for (int t16 = 0; t16 < 4; ++t16) {
+            const uint2 q = *(const uint2*) (ap + (size_t) k * 36 + 4 + 8 * t16);
+            ik2_nv_a_frag(A, q, n, ue4m3_h2((s0 >> (8 * t16)) & 0xFFu));
+            if (live) {
+                const uint4 v = *(const uint4*) (bp + (size_t) k * 64 + 16 * t16 + 8 * n);
+                B.u[0] = v.x, B.u[1] = v.y, B.u[2] = v.z, B.u[3] = v.w;
+            } else {
+                B.u[0] = B.u[1] = B.u[2] = B.u[3] = 0u;
+            }
+            d = ik2_vmmac(A.h, B.h, d);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) part[split][(8 * n + i) * 16 + c] = d[i];
+    __syncthreads();
+    float* tot = part[0];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {   // (128 threads, 256 values)
+        const int j = threadIdx.x + 128 * i;
+#pragma unroll
+        for (int w = 1; w < 4; ++w) part[0][j] += part[w][j];
+    }
+    __syncthreads();
+    if constexpr (Gate) {
+        const int r = threadIdx.x >> 4;   // (8 feature rows x 16 token columns)
+        const int col = threadIdx.x & 15;
+        if (r < 8 && col < count) {
+            const int dst = rows_out[s * kGroupMax + col];
+            const float g = tot[r * 16 + col] * (sg ? sg[dst] : 1.f);
+            const float u = tot[(r + 8) * 16 + col] * (su ? su[dst] : 1.f);
+            hidden[(size_t) dst * F + r0 + r] =
+                f2h(gcap * tanhf(g / gcap) * (1.f / (1.f + expf(-g))) * ucap * tanhf(u / ucap));
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {   // (128 threads, 16 rows x 16 columns)
+            const int j = threadIdx.x + 128 * i;
+            const int r = j >> 4, col = j & 15;
+            if (col < count) out[(size_t) rows_out[s * kGroupMax + col] * C + r0 + r] = tot[j];
+        }
+    }
+}
+template <bool Gate>
+void launch_grouped_expert_wmma(const uint8_t* const* blob, const int* tok, int G, size_t off, int C, int F,
+                                const uint16_t* h, uint16_t* hidden, float* y, const float* sg, const float* su,
+                                float gcap, float ucap, const int* n, const int* row, const uint16_t* input16,
+                                cudaStream_t s) {
+    const dim3 g((unsigned) (Gate ? F / 8 : C / 16), (unsigned) G);
+    grouped_expert_wmma_kernel<Gate><<<g, 128, 0, s>>>(blob, tok, off, C, F, h, hidden, y, sg, su, gcap, ucap, n,
+                                                       row, input16);
+}
+// The one-token expert tile on the same instruction: a warp is 16 rows (gate: the 8 gate rows and the same 8 of up,
+// so a row's SwiGLU is both its halves; down: 16 rows) over its stride of the K blocks.  The two columns the dot
+// needs are the input's FP16 limbs for gate (hi, then lo: a row's two columns add up to the product with the FP32
+// input) and the hidden row itself for down; the other 14 are zero and their outputs unused.
+template <bool Gate, int SPLIT>
+__global__ void __launch_bounds__(SPLIT * 32)
+experts_mma_wmma_kernel(const uint8_t* const* __restrict__ blob, size_t off, int C, int F,
+                        const uint16_t* __restrict__ x16, int x_ld, uint16_t* hidden, float* y, const float* sg,
+                        const float* su, float gcap, float ucap) {
+    __shared__ float part[SPLIT][16 * 16];
+    const int lane = threadIdx.x & 31, split = threadIdx.x >> 5;
+    const int n = lane >> 4, c = lane & 15, rr = lane & 15, slot = blockIdx.y;
+    const int K = Gate ? C : F;
+    const int r0 = blockIdx.x * (Gate ? 8 : 16);
+    const int stride = K / 64 * 36;
+    const int arow = Gate ? r0 + (rr & 7) : r0 + rr;
+    const uint8_t* ap = blob[slot] + (Gate ? (rr < 8 ? 0 : off) : off) + (size_t) arow * stride;
+    const bool live = Gate ? c < 2 : c == 0;
+    const uint16_t* bp = Gate ? x16 + (c == 1 ? (size_t) C : 0) : x16 + (size_t) slot * x_ld;
+    ik2_mfrag A, B;
+    ik2_mf8 d;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) d[i] = 0.0f;
+    const int nk = K / 64;
+    for (int k = split; k < nk; k += SPLIT) {
+        const uint32_t* sp = (const uint32_t*) ap + (size_t) k * 9;
+        const uint32_t s0 = __ldg(sp);
+#pragma unroll
+        for (int t16 = 0; t16 < 4; ++t16) {
+            const uint2 q = *(const uint2*) (ap + (size_t) k * 36 + 4 + 8 * t16);
+            ik2_nv_a_frag(A, q, n, ue4m3_h2((s0 >> (8 * t16)) & 0xFFu));
+            if (live) {
+                const uint4 v = *(const uint4*) (bp + (size_t) k * 64 + 16 * t16 + 8 * n);
+                B.u[0] = v.x, B.u[1] = v.y, B.u[2] = v.z, B.u[3] = v.w;
+            } else {
+                B.u[0] = B.u[1] = B.u[2] = B.u[3] = 0u;
+            }
+            d = ik2_vmmac(A.h, B.h, d);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) part[split][(8 * n + i) * 16 + c] = d[i];
+    __syncthreads();
+    const int rows = Gate ? 8 : 16;
+    if (threadIdx.x < rows) {
+        const int r = threadIdx.x;
+        float tot = 0.0f, totu = 0.0f;
+#pragma unroll
+        for (int w = 0; w < SPLIT; ++w) {
+            if constexpr (Gate) {
+                tot += part[w][r * 16] + part[w][r * 16 + 1];            // (hi + lo limbs)
+                totu += part[w][(r + 8) * 16] + part[w][(r + 8) * 16 + 1];
+            } else {
+                tot += part[w][r * 16];
+            }
+        }
+        if constexpr (Gate) {
+            const float g = tot * (sg ? sg[slot] : 1.0f), u = totu * (su ? su[slot] : 1.0f);
+            hidden[(size_t) slot * F + r0 + r] =
+                f2h(gcap * tanhf(g / gcap) * (1.f / (1.f + expf(-g))) * ucap * tanhf(u / ucap));
+        } else {
+            y[(size_t) slot * C + r0 + r] = tot;
+        }
+    }
+}
+template <bool Gate>
+static void launch_experts_mma_wmma(const uint8_t* const* blob, int S, size_t off, const uint16_t* x16, int x_ld,
+                                    int C, int F, const float* sg, const float* su, float gcap, float ucap,
+                                    uint16_t* h, float* y, cudaStream_t s) {
+    const dim3 g((unsigned) (Gate ? F / 8 : C / 16), (unsigned) S);
+    if (Gate)
+        experts_mma_wmma_kernel<true, 8><<<g, 8 * 32, 0, s>>>(blob, off, C, F, x16, x_ld, h, y, sg, su, gcap, ucap);
+    else
+        experts_mma_wmma_kernel<false, 4><<<g, 4 * 32, 0, s>>>(blob, off, C, F, x16, x_ld, h, y, sg, su, gcap, ucap);
+}
+// (a grouped expert tile runs on the matrix cores only on gfx12 / RDNA4: anywhere else the emulated path stays)
+inline bool ik2_expert_wmma_ok() {
+    static const bool ok = [] {
+        if (getenv("IK2_EXPERT_WMMA") && atoi(getenv("IK2_EXPERT_WMMA")) == 0) return false;
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return false;
+        cudaDeviceProp p{};
+        if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) return false;
+        return std::strncmp(p.gcnArchName, "gfx1200", 7) == 0 || std::strncmp(p.gcnArchName, "gfx1201", 7) == 0;
+    }();
+    return ok;
+}
+#endif   // __HIP_PLATFORM_AMD__
+
 // A block is a group of 16 rows, its SPLIT warps each a stride of the K blocks (more rows of weights in flight than
 // a warp alone keeps: a warp waits for a block's bytes before it asks for more than the next one's).
 template <bool Gate, int SPLIT>
@@ -4438,7 +5004,7 @@ __device__ __forceinline__ int wa_active_block(int pos0, int T, int window, int 
 // attn_decode_mma_kernel for the T tokens of a window: the B columns are (token, head) pairs of the K / V head -
 // column c is token c / R, head g R + c % R - so that the tokens' queries read a key's K and V rows once; NT tiles of
 // 8 columns (T R <= 8 NT).  A column's keys: its token's (causal, its own window); the bias by its own distance.
-template <class KVT, int NT>
+template <class KVT, int NT, bool FAW = true>   // (FAW: IK2_FA_WMMA, as attn_decode_mma_kernel's)
 __global__ void __launch_bounds__(kWaNW * 32, NT == 1 ? 4 : 2)
 attn_block_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__ kc, const KVT* __restrict__ vc,
                       int kv_cap, int H, int Hkv, const int* __restrict__ pos_d, int T, float qk_scale,
@@ -4531,7 +5097,7 @@ attn_block_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__ 
         for (int j = 0; j < NT; ++j) {
             float sa[4] = {0.0f, 0.0f, 0.0f, 0.0f}, sb[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-            for (int kk = 0; kk < kFaD / 16; ++kk) mma16816((kk & 1) ? sb : sa, ka[kk], qf[j][kk][0], qf[j][kk][1]);
+            for (int kk = 0; kk < kFaD / 16; ++kk) fa_mma<FAW>((kk & 1) ? sb : sa, ka[kk], qf[j][kk][0], qf[j][kk][1]);
             float c0 = (sa[0] + sb[0]) * sc, c1 = (sa[1] + sb[1]) * sc, c2 = (sa[2] + sb[2]) * sc,
                   c3 = (sa[3] + sb[3]) * sc;
             const int pa = qpa[j], pb = qpb[j];
@@ -4610,11 +5176,11 @@ attn_block_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__ 
                     e4m3x4_h4(__byte_perm(x0[i], x1[i], 0x5140u), a[0], a[1]);
                     e4m3x4_h4(__byte_perm(x8[i], x9[i], 0x5140u), a[2], a[3]);
 #pragma unroll
-                    for (int j = 0; j < NT; ++j) mma16816(o[j][2 * i], a, pb0[j], pb1[j]);
+                    for (int j = 0; j < NT; ++j) fa_mma<FAW>(o[j][2 * i], a, pb0[j], pb1[j]);
                     e4m3x4_h4(__byte_perm(x0[i], x1[i], 0x7362u), a[0], a[1]);
                     e4m3x4_h4(__byte_perm(x8[i], x9[i], 0x7362u), a[2], a[3]);
 #pragma unroll
-                    for (int j = 0; j < NT; ++j) mma16816(o[j][2 * i + 1], a, pb0[j], pb1[j]);
+                    for (int j = 0; j < NT; ++j) fa_mma<FAW>(o[j][2 * i + 1], a, pb0[j], pb1[j]);
                 }
             } else {
 #pragma unroll
@@ -4628,7 +5194,7 @@ attn_block_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__ 
                         const uint32_t a[4] = {__byte_perm(x0[jj], x1[jj], 0x5410u), __byte_perm(x0[jj], x1[jj], 0x7632u),
                                                __byte_perm(x8[jj], x9[jj], 0x5410u), __byte_perm(x8[jj], x9[jj], 0x7632u)};
 #pragma unroll
-                        for (int j = 0; j < NT; ++j) mma16816(o[j][4 * i + jj], a, pb0[j], pb1[j]);
+                        for (int j = 0; j < NT; ++j) fa_mma<FAW>(o[j][4 * i + jj], a, pb0[j], pb1[j]);
                     }
                 }
             }
@@ -5221,6 +5787,17 @@ bool fa_wgmma() {
     }();
     return on != 0;
 }
+// IK2_FA_WMMA: which product the flash-attention kernels take - the arch's own (the gfx12 matrix core, the CUDA
+// mma.sync; the default, i.e. today's behaviour) or the emulated m16n8k16.  Both are the same sums, so the flag
+// is a speed switch and an A/B instrument, not a numerical one; on an arch without a matrix core it changes
+// nothing (the emulation is what mma16816 already is there).
+bool fa_wmma() {
+    static const bool on = [] {
+        const char* e = getenv("IK2_FA_WMMA");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    return on;
+}
 template <int NW, bool WG, class KVT>
 void attn_flash_launch(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* vc, int kv_cap, int H, int KV,
                        int Tq, int qpos0, float qk_scale, const float* bias, int extent, int window, int n_split,
@@ -5229,14 +5806,25 @@ void attn_flash_launch(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* 
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 16 && !attr[dev]) {
-        cudaFuncSetAttribute(attn_flash_f16_kernel<NW, WG, KVT>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFaSmem);
+#if !defined(__HIP_PLATFORM_AMD__)
+        // (gfx12: kFaSmem is under the 64 KB a workgroup gets by default, and HIP's opt-in rejects it)
+        cudaFuncSetAttribute(attn_flash_f16_kernel<NW, WG, KVT, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             kFaSmem);
+        cudaFuncSetAttribute(attn_flash_f16_kernel<NW, WG, KVT, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             kFaSmem);
         check("attn_flash (shared memory)");
+#endif
         attr[dev] = true;
     }
     const dim3 grid((unsigned) ((Tq + 16 * NW - 1) / (16 * NW)), (unsigned) H, (unsigned) n_split);
-    attn_flash_f16_kernel<NW, WG, KVT><<<grid, NW * 32, kFaSmem, s>>>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0,
-                                                                     qk_scale, bias, extent, window, n_split, o_part,
-                                                                     ml_part);
+    if (fa_wmma())
+        attn_flash_f16_kernel<NW, WG, KVT, true><<<grid, NW * 32, kFaSmem, s>>>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq,
+                                                                              qpos0, qk_scale, bias, extent, window,
+                                                                              n_split, o_part, ml_part);
+    else
+        attn_flash_f16_kernel<NW, WG, KVT, false><<<grid, NW * 32, kFaSmem, s>>>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq,
+                                                                               qpos0, qk_scale, bias, extent, window,
+                                                                               n_split, o_part, ml_part);
     check("attn_flash");
 }
 void attn_flash_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uint16_t* vc, int kv_cap, int H, int KV,
@@ -5629,6 +6217,10 @@ static void launch_experts_mma(const uint8_t* const* blob, int S, size_t off, co
                                int F, const float* sg, const float* su, float gcap, float ucap, uint16_t* h, float* y,
                                cudaStream_t s) {
     const int w = experts_mma_split(Gate);
+    if (ik2_expert_wmma_ok()) {
+        launch_experts_mma_wmma<Gate>(blob, S, off, x16, x_ld, C, F, sg, su, gcap, ucap, h, y, s);
+        return;
+    }
     const dim3 g((unsigned) (Gate ? F / 8 : C / 16), (unsigned) S);
 #define IK2_MMA_LAUNCH(W) experts_mma_kernel<Gate, W><<<g, W * 32, 0, s>>>(blob, off, C, F, x16, x_ld, h, y, sg, su, gcap, ucap)
     if (w == 1) IK2_MMA_LAUNCH(1);
@@ -5683,6 +6275,14 @@ void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, in
                     const uint16_t* h, int C, int F, float* y, cudaStream_t s) {
     if (G <= 0) return;
     static const bool use_group_mma = getenv("IK2_GROUP_MMA") && (atoi(getenv("IK2_GROUP_MMA")) & 2);
+    if (grouped_tensor_products && use_group_mma && ik2_expert_wmma_ok() && ty_down == kNVFP4 && C % 16 == 0 &&
+        F % 64 == 0) {
+        launch_grouped_expert_wmma<false>(blob, nullptr, G, off_down, C, F, h, nullptr, y, nullptr, nullptr, 0, 0, n, row,
+                                          nullptr, s);
+        check("grouped_expert_wmma (grouped)");
+        return;
+    }
+
     if (grouped_tensor_products && use_group_mma && ty_down == kNVFP4 && C % 16 == 0 && F % 64 == 0) {
         grouped_expert_mma<false, 4><<<dim3(C / 16, G), 128, 0, s>>>(blob, nullptr, off_down, C, F, h, nullptr, y,
                                                                      nullptr, nullptr, 0, 0, n, row);
@@ -5737,6 +6337,13 @@ void experts_gate_up_swiglu_g(const uint8_t* const* blob, const int* n, const in
                               const uint16_t* input16) {
     if (G <= 0) return;
     static const bool use_group_mma = getenv("IK2_GROUP_MMA") && (atoi(getenv("IK2_GROUP_MMA")) & 1);
+    if (grouped_tensor_products && use_group_mma && ik2_expert_wmma_ok() && input16 && ty_gate == kNVFP4 &&
+        ty_up == kNVFP4 && F % 8 == 0 && C % 64 == 0) {
+        launch_grouped_expert_wmma<true>(blob, tok, G, eb0, C, F, nullptr, h, nullptr, sg, su, gcap, ucap, n, row, input16,
+                                        s);
+        check("grouped_expert_wmma (grouped)");
+        return;
+    }
     if (grouped_tensor_products && use_group_mma && input16 && ty_gate == kNVFP4 && ty_up == kNVFP4 && F % 8 == 0 && C % 64 == 0) {
         grouped_expert_mma<true, 4><<<dim3(F / 8, G), 128, 0, s>>>(blob, tok, eb0, C, F, nullptr, h, nullptr, sg, su,
                                                                    gcap, ucap, n, row, input16);
@@ -5997,8 +6604,13 @@ int attn_decode_mma_blocks(int Hkv) {
     int dev = 0, n_sm = 0, occ16 = 0, occ8 = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, dev);
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ16, attn_decode_mma_kernel<uint16_t>, kWaNW * 32, 0);
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ8, attn_decode_mma_kernel<uint8_t>, kWaNW * 32, 0);
+    if (fa_wmma()) {
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ16, attn_decode_mma_kernel<uint16_t, true>, kWaNW * 32, 0);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ8, attn_decode_mma_kernel<uint8_t, true>, kWaNW * 32, 0);
+    } else {
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ16, attn_decode_mma_kernel<uint16_t, false>, kWaNW * 32, 0);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ8, attn_decode_mma_kernel<uint8_t, false>, kWaNW * 32, 0);
+    }
     check("attn_decode_mma (occupancy)");
     return std::max(1, n_sm * std::min(occ16, occ8) / std::max(1, Hkv));
 }
@@ -6016,9 +6628,14 @@ void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink
     float* o_part = scratch;
     float2* ml_part = (float2*) (o_part + (size_t) n_split * kWaNW * H * kFaD);
     const bool rel4 = d_rel % 4 == 0 && (((uintptr_t) r | (uintptr_t) proj) & 15) == 0;
-    attn_decode_mma_kernel<KV><<<dim3((unsigned) Hkv, (unsigned) n_split), kWaNW * 32, 0, s>>>(
-        q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, rel4, extent, window, n_split, o_part,
-        ml_part);
+    if (fa_wmma())
+        attn_decode_mma_kernel<KV, true><<<dim3((unsigned) Hkv, (unsigned) n_split), kWaNW * 32, 0, s>>>(
+            q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, rel4, extent, window, n_split, o_part,
+            ml_part);
+    else
+        attn_decode_mma_kernel<KV, false><<<dim3((unsigned) Hkv, (unsigned) n_split), kWaNW * 32, 0, s>>>(
+            q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, rel4, extent, window, n_split, o_part,
+            ml_part);
     check("attn_decode_mma");
     attn_decode_mma_combine_kernel<<<(unsigned) H, kFaD, (size_t) (kFaD + n_split * kWaNW) * sizeof(float), s>>>(
         o_part, ml_part, n_split, H, sink, v_inv, pos, qpos, window, gate, out, out16);
@@ -6107,9 +6724,14 @@ static void attn_block_launch(const uint16_t* q16, const float* r, int r_ld, con
     float* o_part = scratch;
     float2* ml_part = (float2*) (o_part + (size_t) n_split * kWaNW * T * H * kFaD);
     const bool rel4 = d_rel % 4 == 0 && r_ld % 4 == 0 && (((uintptr_t) r | (uintptr_t) proj) & 15) == 0;
-    attn_block_mma_kernel<KV, NT><<<dim3((unsigned) Hkv, (unsigned) n_split), kWaNW * 32, 0, s>>>(
-        q16, kc, vc, kv_cap, H, Hkv, pos, T, qk_scale, r, r_ld, proj, d_rel, rel4, extent, window, n_split, o_part,
-        ml_part);
+    if (fa_wmma())
+        attn_block_mma_kernel<KV, NT, true><<<dim3((unsigned) Hkv, (unsigned) n_split), kWaNW * 32, 0, s>>>(
+            q16, kc, vc, kv_cap, H, Hkv, pos, T, qk_scale, r, r_ld, proj, d_rel, rel4, extent, window, n_split, o_part,
+            ml_part);
+    else
+        attn_block_mma_kernel<KV, NT, false><<<dim3((unsigned) Hkv, (unsigned) n_split), kWaNW * 32, 0, s>>>(
+            q16, kc, vc, kv_cap, H, Hkv, pos, T, qk_scale, r, r_ld, proj, d_rel, rel4, extent, window, n_split, o_part,
+            ml_part);
     check("attn_block_mma");
     attn_block_combine_kernel<<<dim3((unsigned) H, (unsigned) T), kFaD,
                                 (size_t) (kFaD + n_split * kWaNW) * sizeof(float), s>>>(
