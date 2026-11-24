@@ -52,6 +52,15 @@ python tools/strata_tokenizer.py --gguf models/Inkling-2-Mini-UD-Q4_K_XL.gguf --
 
 The second command fetches the drafter, `mtp.safetensors` (0.6 GB) from Thinking Machines' own repository; skip it if you run the configs without the drafter. The third writes the tokenizer files the server reads to `ik2/tokenizer`. Only `UD-Q4_K_XL` works: `UD-Q8_K_XL` keeps the experts of the last 4 layers in BF16, which the engine doesn't load. Both files carry the same NVFP4 experts for layers 0 to 19, so `UD-Q8_K_XL` wouldn't be faster or much more exact anyway.
 
+If the engine stops with `no key inkling2.block_count`, the file is in the newer layout (`inkling2_loop`) that Unsloth uploaded to the root of the repository on 2026-11-23. The engine reads the older `inkling2` layout, which is kept in the `Old_Support/` folder of the same repository under the name `Inkling-2-Mini-UD-Q4_K_XL.gguf_file`. Download that file and save it as `models/Inkling-2-Mini-UD-Q4_K_XL.gguf`:
+
+```bash
+hf download unsloth/Inkling-2-Mini-GGUF Old_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file --local-dir models
+mv models/Old_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file models/Inkling-2-Mini-UD-Q4_K_XL.gguf
+```
+
+Other quants fail on tensor types the engine does not decode (for example `UD-IQ3_XXS` stops at `type IQ2_XXS not decoded here`; `UD-Q2_K_XL` also uses IQ1_S, MXFP4 and a newer expert type).
+
 ### 4. Run
 
 ```bash
@@ -72,7 +81,7 @@ To pick the card, set `CUDA_VISIBLE_DEVICES` before the command.
 
 ## Configs
 
-All 5 configs are in [`docs/inkling2-mini/`](inkling2-mini/). For details on the 8 GB card setup, see [An 8 GB card](#an-8-gb-card).
+All 6 configs are in [`docs/inkling2-mini/`](inkling2-mini/). For details on the 8 GB card setup, see [An 8 GB card](#an-8-gb-card); for a 16 GB card, see [A 16 GB card](#a-16-gb-card).
 
 | Config | Context | Drafter | Image encoder | VRAM |
 |---|---:|---|---|---:|
@@ -81,6 +90,7 @@ All 5 configs are in [`docs/inkling2-mini/`](inkling2-mini/). For details on the
 | `ik2-mini-text.json` | 344,064 | no | none | the same |
 | `ik2-mini-gpu-vision.json` | 262,144 | no | GPU, 1.3 GiB | 23.7 GiB |
 | `ik2-mini-8gb.json` | 16,384 | no | none | ~7 GiB (experts in host RAM) |
+| `ik2-mini-16gb.json` | 16,384 | no | none | ~15 GiB (experts in host RAM, 11.7 GiB cache) |
 
 **Check that every expert stays in VRAM.** The VRAM column is with nothing else on the card. If another program
 holds some of it, the configs above may not fit, and then the experts stay in host memory and decode runs at 50
@@ -173,6 +183,22 @@ Decode slows down with depth for a physical reason. 8 of the 48 layer visits att
 | `IK2_LAZY_MAX=2`, `IK2_LAZY_PER=1` | At most 2 background copies in flight and 1 started per layer visit. The cache still follows the text: 84% hits against 49% with no copies |
 
 The limits on that laptop: the CPU computes a miss at 37 to 41 GB/s of the 58 GB/s the RAM gives, and the GPU kernels of a token take about 15 ms. A longer context leaves less VRAM for the cache, so 32,768 tokens give about 36 tok/s and 65,536 about 32.
+
+## A 16 GB card
+
+[`ik2-mini-16gb.json`](inkling2-mini/ik2-mini-16gb.json) is the 8 GB config with a bigger expert cache (`--cache-gb 12`) and the CPU lane off (`IK2_CPU=0`). Measured on an RTX 5060 Ti 16 GB, an i5-14600KF (no AVX-512), 32 GB of DDR4-3200, Windows 11 with MSVC and CUDA 13.5, `UD-Q4_K_XL`, 16,384 token context, 300 generated tokens:
+
+| `--cache-gb` | `IK2_CPU` | Decode tok/s |
+|---:|---:|---:|
+| 7 | 1 | 30 |
+| 10 | 1 | 39 |
+| 12 | 1 | 39 |
+| 12 | 0 | 43 (CLI), 40 (server, three chat prompts) |
+
+- The cache is the lever: going from 7 to 12 GB gave about 30% more. Larger values are capped to what fits (2446 slots, 11.7 GiB on this card), and 14.5 GB was slower (30.8 tok/s).
+- `--threads` from 6 to 16 changed decode speed by about 5% (40.2 to 42.1 tok/s).
+- With a cache this large the CPU lane did not help: it started, but `IK2_CPU=0` was slightly faster and had fewer cache misses. I did not measure smaller cards here; the 8 GB config keeps the lane on.
+- These are single runs on one machine; expect a few tok/s of spread.
 
 ## How it works
 
