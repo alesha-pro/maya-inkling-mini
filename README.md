@@ -58,7 +58,7 @@ python serve/server.py --engine maya --config docs/inkling2-mini/ik2-mini.json -
 
 For an **AMD GPU (HIP)**, configure with `-DSTRATA_ENABLE_HIP=ON -DSTRATA_HIP_IK2_SPIKE=ON -DSTRATA_PREFILL_MMQ=ON` and your `AMDGPU_TARGETS` / `CMAKE_HIP_ARCHITECTURES` (for example `gfx1201`). See the [guide](docs/INKLING2-MINI.md#quick-start) for Windows MSVC and AMD HIP build flags.
 
-Then talk to `http://127.0.0.1:18000/v1` with any OpenAI or Anthropic client, model `inkling-2-mini`. There are 5 configs in [`docs/inkling2-mini/`](docs/inkling2-mini/): the default (`ik2-mini.json`: DSpark drafter, 262K context, CPU vision), longest context (`ik2-mini-long.json`: 344K, no drafter), text only (`ik2-mini-text.json`), GPU vision (`ik2-mini-gpu-vision.json`), and 8 GB GPUs (`ik2-mini-8gb.json`: 16K context, ~41 tok/s). Add `"--parallel", "4"` to `args` in a config to serve concurrent requests.
+Then talk to `http://127.0.0.1:18000/v1` with any OpenAI or Anthropic client, model `inkling-2-mini`. There are 6 configs in [`docs/inkling2-mini/`](docs/inkling2-mini/): the default (`ik2-mini.json`: DSpark drafter, 262K context, CPU vision), longest context (`ik2-mini-long.json`: 344K, no drafter), text only (`ik2-mini-text.json`), GPU vision (`ik2-mini-gpu-vision.json`), 8 GB GPUs (`ik2-mini-8gb.json`: 16K context, ~41 tok/s), and 16 GB GPUs (`ik2-mini-16gb.json`: 16K context, 12 GB expert cache, 40+ tok/s on an RTX 5060 Ti). Add `"--parallel", "4"` to `args` in a config to serve concurrent requests.
 
 ## Why it's faster than llama.cpp
 
