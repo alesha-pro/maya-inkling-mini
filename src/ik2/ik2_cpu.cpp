@@ -2,6 +2,20 @@
 #include "ik2_cpu.hpp"
 
 #include <immintrin.h>
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#endif
+
+// the AVX-512 kernels: GCC / Clang through target attributes, MSVC (whose intrinsics need no /arch) as they are
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define IK2_X86_AVX512 1
+#define IK2_TARGET(t) __attribute__((target(t)))
+#elif defined(_MSC_VER) && defined(_M_X64)
+#define IK2_X86_AVX512 1
+#define IK2_TARGET(t)
+#else
+#define IK2_X86_AVX512 0
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -9,13 +23,46 @@
 
 namespace ik2::cpu {
 
-bool available() {
+namespace {
+#if IK2_X86_AVX512
+bool avx512_ok() {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
     return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw");
 #else
-    return false;
+    // MSVC: the CPU's AVX-512 F / BW / VL bits (leaf 7) and the OS saving the ZMM state (XCR0 bits 1, 2, 5, 6, 7)
+    int r[4];
+    __cpuid(r, 0);
+    if (r[0] < 7) return false;
+    __cpuid(r, 1);
+    if (!(r[2] & (1 << 27)) || !(r[2] & (1 << 12)) || !(r[2] & (1 << 29))) return false;   // OSXSAVE, FMA, F16C
+    if ((_xgetbv(0) & 0xE6) != 0xE6) return false;
+    __cpuidex(r, 7, 0);
+    const unsigned ebx = (unsigned) r[1], f = 1u << 16, bw = 1u << 30, vl = 1u << 31;
+    return (ebx & f) && (ebx & bw) && (ebx & vl);
 #endif
 }
+// AVX2 + FMA + F16C (Intel's client cores since Alder Lake have no AVX-512): CPUID leaf 1 and 7, XCR0 YMM state
+bool avx2_ok() {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
+#else
+    int r[4];
+    __cpuid(r, 0);
+    if (r[0] < 7) return false;
+    __cpuid(r, 1);
+    if (!(r[2] & (1 << 27)) || !(r[2] & (1 << 12)) || !(r[2] & (1 << 29))) return false;   // OSXSAVE, FMA, F16C
+    if ((_xgetbv(0) & 0x6) != 0x6) return false;
+    __cpuidex(r, 7, 0);
+    return (r[1] & (1 << 5)) != 0;   // AVX2
+#endif
+}
+#else
+bool avx512_ok() { return false; }
+bool avx2_ok() { return false; }
+#endif
+}  // namespace
+
+bool available() { return avx512_ok() || avx2_ok(); }
 
 Pool::Pool(int n) {
     for (int i = 0; i < n; ++i)
@@ -93,9 +140,9 @@ struct ScaleTable {
 };
 const ScaleTable g_scale;
 
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#if IK2_X86_AVX512
 // a 36-byte block: four UE4M3 scales, then 8 bytes a 16-value sub-block (value j < 8 the low nibble of byte j)
-__attribute__((target("avx512f,avx512bw,avx512vl,fma")))
+IK2_TARGET("avx512f,avx512bw,avx512vl,fma")
 void nvfp4_rows_avx512(const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
     const __m128i tab = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
     const __m128i m4 = _mm_set1_epi8(0x0F);
@@ -127,6 +174,65 @@ void nvfp4_rows_avx512(const uint8_t* W, int K, int r0, int r1, const float* x, 
 }
 #endif
 
+#if IK2_X86_AVX512
+static inline float hsum256(__m256 v) {
+    __m128 a = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    a = _mm_add_ps(a, _mm_movehl_ps(a, a));
+    a = _mm_add_ss(a, _mm_shuffle_ps(a, a, 1));
+    return _mm_cvtss_f32(a);
+}
+
+// the same 36-byte NVFP4 blocks as above, 8 values a step
+IK2_TARGET("avx2,fma")
+void nvfp4_rows_avx2(const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
+    const __m128i tab = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+    const __m128i m4 = _mm_set1_epi8(0x0F);
+    const int nb = K / 64;
+    const size_t rb = (size_t) nb * 36;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* b = W + (size_t) r * rb;
+        __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+        const float* xp = x;
+        for (int i = 0; i < nb; ++i, b += 36, xp += 64) {
+            for (int sb = 0; sb < 4; ++sb) {
+                const __m128i raw = _mm_loadl_epi64((const __m128i*) (b + 4 + sb * 8));
+                const __m128i lo = _mm_and_si128(raw, m4);
+                const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), m4);
+                const __m128i val = _mm_shuffle_epi8(tab, _mm_unpacklo_epi64(lo, hi));
+                const __m256 v0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(val));
+                const __m256 v1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(val, 8)));
+                const __m256 sc = _mm256_set1_ps(g_scale.v[b[sb]]);
+                acc0 = _mm256_fmadd_ps(v0, _mm256_mul_ps(_mm256_loadu_ps(xp + sb * 16), sc), acc0);
+                acc1 = _mm256_fmadd_ps(v1, _mm256_mul_ps(_mm256_loadu_ps(xp + sb * 16 + 8), sc), acc1);
+            }
+        }
+        out[r - r0] = hsum256(_mm256_add_ps(acc0, acc1));
+    }
+}
+
+IK2_TARGET("avx2,fma,f16c")
+void q8_0_rows_avx2(const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
+    const int nb = K / 32;
+    const size_t rb = (size_t) nb * 34;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* b = W + (size_t) r * rb;
+        __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+        const float* xp = x;
+        for (int i = 0; i < nb; ++i, b += 34, xp += 32) {
+            uint16_t h;
+            std::memcpy(&h, b, 2);
+            const __m256 d = _mm256_set1_ps(_mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h))));
+            for (int q = 0; q < 4; ++q) {
+                const __m256 v = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*) (b + 2 + q * 8))));
+                __m256& acc = (q & 1) ? acc1 : acc0;
+                acc = _mm256_fmadd_ps(v, _mm256_mul_ps(_mm256_loadu_ps(xp + q * 8), d), acc);
+            }
+        }
+        out[r - r0] = hsum256(_mm256_add_ps(acc0, acc1));
+    }
+}
+#endif
+
 void nvfp4_rows_scalar(const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
     static const int kv[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
     const int nb = K / 64;
@@ -147,8 +253,8 @@ void nvfp4_rows_scalar(const uint8_t* W, int K, int r0, int r1, const float* x, 
     }
 }
 
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-__attribute__((target("avx512f,avx512bw,avx512vl,fma,f16c")))
+#if IK2_X86_AVX512
+IK2_TARGET("avx512f,avx512bw,avx512vl,fma,f16c")
 void q8_0_rows_avx512(const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
     const int nb = K / 32;
     const size_t rb = (size_t) nb * 34;
@@ -159,7 +265,7 @@ void q8_0_rows_avx512(const uint8_t* W, int K, int r0, int r1, const float* x, f
         for (int i = 0; i < nb; ++i, b += 34, xp += 32) {
             uint16_t h;
             std::memcpy(&h, b, 2);
-            const __m512 d = _mm512_set1_ps(_cvtsh_ss(h));
+            const __m512 d = _mm512_set1_ps(_mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h))));   // (MSVC has no _cvtsh_ss)
             const __m512 v0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i*) (b + 2))));
             const __m512 v1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i*) (b + 18))));
             acc0 = _mm512_fmadd_ps(v0, _mm512_mul_ps(_mm512_loadu_ps(xp), d), acc0);
@@ -200,10 +306,14 @@ void q8_0_rows_scalar(const uint8_t* W, int K, int r0, int r1, const float* x, f
 }  // namespace
 
 void q8_0_rows(const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-    static const bool fast = available();
-    if (fast) {
+#if IK2_X86_AVX512
+    static const int fast = avx512_ok() ? 2 : avx2_ok() ? 1 : 0;
+    if (fast == 2) {
         q8_0_rows_avx512(W, K, r0, r1, x, out);
+        return;
+    }
+    if (fast == 1) {
+        q8_0_rows_avx2(W, K, r0, r1, x, out);
         return;
     }
 #endif
@@ -211,10 +321,14 @@ void q8_0_rows(const uint8_t* W, int K, int r0, int r1, const float* x, float* o
 }
 
 void nvfp4_rows(const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-    static const bool fast = available();
-    if (fast) {
+#if IK2_X86_AVX512
+    static const int fast = avx512_ok() ? 2 : avx2_ok() ? 1 : 0;
+    if (fast == 2) {
         nvfp4_rows_avx512(W, K, r0, r1, x, out);
+        return;
+    }
+    if (fast == 1) {
+        nvfp4_rows_avx2(W, K, r0, r1, x, out);
         return;
     }
 #endif
