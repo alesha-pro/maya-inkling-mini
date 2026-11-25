@@ -203,6 +203,7 @@ What I tried that didn't help:
 
 ## Quality
 
+* The whole GSM8K test set (1319), one recipe (`tools/gsm8k_bench.py`, bench/gsm8k): greedy, thinking off, through the server with the drafter. FP8 cache 1168 (88.5 %), FP16 1185 (89.8 %); 95 questions change with the cache alone, exact McNemar p = 0.10. The 96-question figures below come from earlier harnesses that are not in the repo, so they do not compare with these or with each other (74 below, 89 / 90 with `--parallel`).
 * 96 GSM8K questions, greedy, reasoning off: 73 solved with the scalar expert kernels, 74 with the tensor core ones (3 lost, 4 gained).
 * 399 forced tokens of real text with an FP16 cache, tensor core experts against scalar: median KL 5.7e-5, the same top token on 394. The model is sensitive on this text: the tensor core attention against its scalar kernel gives 1.7e-4 and 393.
 * The drafter's window against the general prompt path on the same tokens, FP16 cache: KL about 5e-8 per row (up to 5e-4 at near router ties). 96 GSM8K questions, greedy: 77 solved with the drafter, 74 without.

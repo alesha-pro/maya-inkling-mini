@@ -284,6 +284,25 @@ in one launch for the rejected tokens - one CUDA graph a window size. A window o
 probability of it and otherwise samples the model's distribution without it, which is the model's distribution
 exactly.
 
+What "the model's distribution" is when sampling (`src/ik2/ik2_sample.hpp`, checked on the CPU by
+`tests/ik2_sampler_test.cpp`):
+
+- **It is truncated.** softmax(logit / temperature) over the top_p mass of the min(top_k, 1000) largest logits,
+  renormalised; ties go to the lower token. With top_k 0 and top_p 1 the engine samples from the top 1000, never the
+  whole vocabulary, and the server sends top_k 64 for a request's 0 or anything above 64, so through the API it is
+  the top 64 at most. top_p is a share of that truncated mass. The drafter's verification is exact with respect to
+  this distribution, the same one plain decode samples.
+- **Greedy and sampling read the logits at different points**, the same token either way: greedy takes the argmax
+  before the final softcap (`final_logit_softcapping`), sampling the softcapped logits. The softcap is monotonic, so
+  the argmax only differs where the cap rounds two top logits to the same float.
+- **min_p, the repetition / frequency / presence penalties and logit_bias are not read by maya-ik2.** The server
+  passes them on the GEN line and the engine skips keys it does not know: a request with them samples as without.
+- **A seed reproduces an answer only without the drafter's adaptive windows.** A `seed` reseeds the request's
+  generator. Without one, the `--parallel 1` loop draws from one generator seeded 1234 at start, so an answer depends
+  on every sampled request before it; `--parallel N` seeds each request from its id. With the drafter, every window
+  uses one uniform per draft checked, and the window's width comes from `SpecCtl`, which reads measured times: the
+  same seed can give another answer from one run to the next. `IK2_DRAFT_ADAPT=0` fixes the width.
+
 Whether a window pays depends on the text: the drafts are taken 1.8 tokens a step in prose, 3 in new code, 4.3 in a
 document's edit. A controller decides each step (`SpecCtl`): a window of B's expected tokens, (1 - a^B) / (1 - a)
 with a the recent acceptance, over its measured time, against a plain token's; after 8 plain tokens it drafts once
