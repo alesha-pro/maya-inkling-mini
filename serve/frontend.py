@@ -681,9 +681,10 @@ def _clear_thinking(req: dict) -> dict:
 
 
 def openai_to_messages(req: dict, deepseek: bool = False,
-                       glm_dsa: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
+                       glm_dsa: bool = False, tool_ids: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs).  glm_dsa (GLM-5.3's template,
-    ChatTemplate.glm_dsa): the tool call ids and clear_thinking go to the template too."""
+    ChatTemplate.glm_dsa): the tool call ids and clear_thinking go to the template too.  tool_ids (Inkling's template,
+    ChatTemplate.inkling): the tool call ids, which it names each tool result's tool by."""
     if deepseek:
         from serve.ds41_encoding import _tool_name_for_encoding, tools_from_openai_format
         messages = copy.deepcopy(req.get("messages", []))
@@ -745,7 +746,9 @@ def openai_to_messages(req: dict, deepseek: bool = False,
         out = {"role": role, "content": _parts_of(m.get("content")) if role in ("user", "tool", "assistant") else _text_of(m.get("content"))}
         if m.get("reasoning_content"):
             out["reasoning_content"] = m["reasoning_content"]
-        if glm_dsa and role == "tool" and m.get("tool_call_id"):   # GLM-5.3 orders parallel results by id
+        # the call ids, for the templates that read them (tool_ids, glm_dsa): Inkling's names a result's tool by its
+        # call's id, GLM-5.3's orders parallel results by it; the others' prompts stay as they were
+        if (glm_dsa or tool_ids) and role == "tool" and m.get("tool_call_id"):
             out["tool_call_id"] = m["tool_call_id"]
         if m.get("tool_calls"):
             calls = []
@@ -755,7 +758,7 @@ def openai_to_messages(req: dict, deepseek: bool = False,
                 if isinstance(args, str):               # the template requires a mapping, not a JSON string
                     args = json.loads(args) if args.strip() else {}
                 calls.append({"function": {"name": fn.get("name"), "arguments": args or {}}})
-                if glm_dsa and c.get("id"):
+                if (glm_dsa or tool_ids) and c.get("id"):
                     calls[-1]["id"] = c["id"]
             out["tool_calls"] = calls
         if role == "assistant" and not out["content"] and not out.get("tool_calls") and not out.get("reasoning_content"):
@@ -786,9 +789,10 @@ def openai_to_messages(req: dict, deepseek: bool = False,
     return _late_system_to_user(_json_format_note(req, messages)), tools, kwargs
 
 
-def anthropic_to_messages(req: dict, deepseek: bool = False,
-                          glm_dsa: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
-    """Anthropic Messages -> (template messages, template tools, template kwargs).  glm_dsa: as openai_to_messages."""
+def anthropic_to_messages(req: dict, deepseek: bool = False, glm_dsa: bool = False,
+                          tool_ids: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
+    """Anthropic Messages -> (template messages, template tools, template kwargs).  glm_dsa, tool_ids: as
+    openai_to_messages.  A content block it does not render is a ValueError (the request's 400), not dropped."""
     messages = []
     system = req.get("system")
     if system:
@@ -808,26 +812,38 @@ def anthropic_to_messages(req: dict, deepseek: bool = False,
             # of the preceding assistant calls, retaining surrounding text.
             messages.append({"role": "user", "content_blocks": copy.deepcopy(content or [])})
             continue
-        text, reasoning, calls = [], [], []
+        text, reasoning, calls, media = [], [], [], False
         for block in content or []:
             kind = block.get("type")
             if kind == "text":
                 text.append(block.get("text", ""))
             elif kind == "thinking":
                 reasoning.append(block.get("thinking", ""))
+            elif kind == "redacted_thinking":
+                pass   # another provider's encrypted reasoning: nothing a local model can read
             elif kind == "tool_use":
                 call = {"function": {"name": block.get("name"), "arguments": block.get("input") or {}}}
                 if deepseek:
                     call.update(id=block.get("id", ""), type="function")
-                elif glm_dsa and block.get("id"):
+                elif (glm_dsa or tool_ids) and block.get("id"):   # (as openai_to_messages)
                     call["id"] = block["id"]
                 calls.append(call)
             elif kind == "tool_result":
                 messages.append({"role": "tool", "content": _parts_of(block.get("content"))})
-                if glm_dsa and block.get("tool_use_id"):
+                if (glm_dsa or tool_ids) and block.get("tool_use_id"):
                     messages[-1]["tool_call_id"] = block["tool_use_id"]
-        if text or calls or reasoning:
-            out = {"role": m["role"], "content": ("\n\n" if deepseek else "").join(text)}
+            elif kind in IMAGE_PARTS + VIDEO_PARTS:
+                media = True   # beside a tool_result (a message of media and text alone took the path above)
+            else:
+                # a block this server does not render: a 400 naming it, not an answer to a conversation that
+                # silently lost part of itself
+                raise ValueError(f"content block type {kind!r} is not supported here (supported: text, image, "
+                                 "document, thinking, tool_use, tool_result)")
+        if text or calls or reasoning or media:
+            body = ("\n\n" if deepseek else "").join(text)
+            if media:   # the text and the media in their order, the template's list form
+                body = _parts_of([b for b in content if b.get("type") in ("text",) + IMAGE_PARTS + VIDEO_PARTS])
+            out = {"role": m["role"], "content": body}
             if reasoning:
                 out["reasoning_content"] = "".join(reasoning)
             if calls:
