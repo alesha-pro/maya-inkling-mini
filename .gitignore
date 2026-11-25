@@ -62,3 +62,9 @@ build-vision.bat
 /data/hy4-cpu-lane.txt
 /data/hy4-cpu-lane.txt.new
 /data/vram-room.json
+
+# dumps completos del control de paridad (bench/parity): grandes, se regeneran
+/data/ik2/parity/
+# ...pero las referencias compactas (verificadas por MANIFEST.sha256) y los logs de la línea base sí se versionan
+!/bench/parity/ref/*.npz
+!/bench/baseline/results/**/*.log
