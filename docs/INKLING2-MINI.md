@@ -172,6 +172,8 @@ Decode slows down with depth for a physical reason. 8 of the 48 layer visits att
 | `IK2_LAZY_CPU=1` | An expert still arriving from a background copy goes to the CPU, so the GPU does not wait for it |
 | `IK2_LAZY_MAX=2`, `IK2_LAZY_PER=1` | At most 2 background copies in flight and 1 started per layer visit. The cache still follows the text: 84% hits against 49% with no copies |
 
+The CPU lane (`IK2_CPU`) needs AVX-512 (`avx512f` and `avx512bw`). Without it, as on a Ryzen 3000 or most Intel desktop CPUs, the engine says `IK2_CPU=1 ignored` and copies every missing expert over PCIe instead, which is much slower on a narrow link. The engine's results are the same either way: the 8 GB path without the lane passes the parity gate as the resident path does (`bench/parity`, mode `cpu8`: top-1 98.4 %, KL mean 2.9e-3).
+
 The limits on that laptop: the CPU computes a miss at 37 to 41 GB/s of the 58 GB/s the RAM gives, and the GPU kernels of a token take about 15 ms. A longer context leaves less VRAM for the cache, so 32,768 tokens give about 36 tok/s and 65,536 about 32.
 
 ## How it works
