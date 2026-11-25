@@ -305,8 +305,14 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     auto* d = new Drafter;
     d->C = C, d->ctx = ctx, d->blas = blas, d->s = s;
     {
+#if defined(STRATA_USE_HIP)
+        // (IK2_DRAFT_CTX: the positions the layer without a window sees, the last ones; default 65,536 - dsc lane:
+        //  0.25 GiB of KV and 1.7 ms a window at 64K, against 1.0 GiB and 6.7 ms at 256K, REPORT_dsparkcode s5)
+        const int want = getenv("IK2_DRAFT_CTX") ? std::atoi(getenv("IK2_DRAFT_CTX")) : std::min(ctx, 65536);
+#else
         // (IK2_DRAFT_CTX: the positions the layer without a window sees, the last ones; default the whole context)
         const int want = getenv("IK2_DRAFT_CTX") ? std::atoi(getenv("IK2_DRAFT_CTX")) : ctx;
+#endif  // STRATA_USE_HIP
         d->cap = std::min(ctx, std::max(want, 2048));
     }
     const bool mini = C == 2304;
@@ -500,8 +506,13 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
     k::rms(d->res, d->norm, T, C, d->eps, d->h, d->s);   // the draft hidden, rows 1 .. 7 used
     // base logits of rows 1 .. 7 through the target's head
     k::to_f16(d->h + C, (size_t) proposals * C, (uint16_t*) d->x16, d->s);
+#if defined(STRATA_USE_HIP)
+    if (d->head_q8)   // (HIP: IK2_DSC bit 2 - the F32 rows through the blocks, mv_q8p's sums; Maya's q8_tile is CUDA's)
+        k::mv_q8p_rows(d->head_q8, d->head_q8d, n_rows, C, d->h + C, C, proposals, d->base, n_rows, d->s);
+#else
     if (d->head_q8)
         k::q8_tile(d->head_q8, d->head_q8d, n_rows, C, (const uint16_t*) d->x16, proposals, d->base, n_rows, d->s);
+#endif  // STRATA_USE_HIP
     else
         gemm_h(d, lm_f16, n_rows, C, d->x16, proposals, d->base, n_rows);
     const int shortlist_n = (n_vocab + 31) / 32;

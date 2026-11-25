@@ -10,6 +10,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#if defined(STRATA_USE_HIP)
+#include <utility>
+#endif  // STRATA_USE_HIP
 
 namespace ik2::k {
 namespace {
@@ -894,6 +897,7 @@ __global__ void attn_probs_bias_f16_kernel(const float* lg, uint16_t* out16, int
     for (int j = j_hi + tid; j < nk; j += kBlk) row_out[j] = 0;
 }
 
+#if !defined(STRATA_USE_HIP)   // (AMD: the PTX tensor-core path is not built)
 // Prefill attention in one pass (FlashAttention-2 style, tensor cores via mma.sync m16n8k16, FP16 in / F32
 // accumulate): the logits never leave registers.  A block: 64 queries (4 warps x 16) of one head against one split of
 // its keys, in tiles of 64; the online softmax in the log2 domain.  Each split writes its unnormalised output and its
@@ -1617,6 +1621,7 @@ __global__ void attn_decode_mma_combine_kernel(const float* __restrict__ o_part,
     if (out16) out16[(size_t) h * kFaD + d] = f2h(res);
 }
 
+#endif  // !STRATA_USE_HIP
 template <bool WRITE_F16, bool WRITE_F32>
 __global__ void gate_mul_impl_kernel(float* o, const float* g, size_t n, uint16_t* o16) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -2670,6 +2675,7 @@ __global__ void nv_limb_mv(const uint8_t* const* blobs, const NvInput* packed, s
 }
 
 // Each warp multiplies 16 expert rows by the distinct token inputs in its group.
+#if !defined(STRATA_USE_HIP)   // (AMD: the PTX tensor-core path is not built)
 __device__ __forceinline__ uint32_t ik2_fp4pair(uint32_t v, uint32_t scale) {
     const uint32_t mag = __byte_perm(0x42403c00u, 0x4a484644u, (v & 0x0707u) << 4);
     const uint32_t sign = ((v & 8u) << 12) | ((v & 0x800u) << 20);
@@ -2871,6 +2877,7 @@ experts_mma_kernel(const uint8_t* const* __restrict__ blob, size_t off, int C, i
     }
 }
 
+#endif  // !STRATA_USE_HIP
 template <int WARPS, int ROWS>
 __global__ void experts_gate_up_kernel(const uint8_t* const* blob, const int* tok, int ty_gate, int ty_up, size_t eb0,
                                        const float* x, int C, int F, size_t rb_gate, size_t rb_up, float* gu) {
@@ -3673,6 +3680,15 @@ __global__ void attn_decode_kernel(const float* q, const float* r, const float* 
     }
     out[(size_t) h * 128 + tid] = (o / den) * v_inv_scale;
 }
+#if defined(STRATA_USE_HIP)
+// f2h(a * s) with a -0 product kept -0.  clang for gfx1151 compiles the FP16 of a product as v_fma_mix{lo,hi}_f16
+// a, s, 0, and that FMA's +0 addend makes a -0 product +0 (-0 * s + 0 = +0); CUDA keeps -0 (E4M3FN byte 0x80 unpacks
+// to 0x8000).  Every other product is the same bits (the instruction rounds the FMA to FP32, then to FP16).  The sign
+// of a product is a's sign XOR s's, zero or not: OR it back in.
+__device__ __forceinline__ uint16_t f2h_mul(float a, float s) {
+    return f2h(a * s) | (uint16_t) (((float_to_bits(a) ^ float_to_bits(s)) >> 16) & 0x8000u);
+}
+#endif  // STRATA_USE_HIP
 
 __global__ void unpack_kv_fp8_to_f16_vec4_kernel(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk,
                                                  int KD, float k_inv_scale, float v_inv_scale, uint16_t* k_out16,
@@ -3688,15 +3704,27 @@ __global__ void unpack_kv_fp8_to_f16_vec4_kernel(const uint8_t* kc, const uint8_
             const uint32_t k4 = __ldg((const uint32_t*) (kc + src_off) + d4);
             const float2 f0 = e4m3fnx2_to_f2((uint16_t) (k4 & 0xFFFFu));
             const float2 f1 = e4m3fnx2_to_f2((uint16_t) (k4 >> 16));
+#if defined(STRATA_USE_HIP)
+            ((uint2*) (k_out16 + dst_off))[d4] =
+                make_uint2(f2h_mul(f0.x, k_inv_scale) | (uint32_t) f2h_mul(f0.y, k_inv_scale) << 16,
+                           f2h_mul(f1.x, k_inv_scale) | (uint32_t) f2h_mul(f1.y, k_inv_scale) << 16);
+#else
             ((uint2*) (k_out16 + dst_off))[d4] = make_uint2(f2_to_u32(f0.x * k_inv_scale, f0.y * k_inv_scale),
                                                             f2_to_u32(f1.x * k_inv_scale, f1.y * k_inv_scale));
+#endif  // STRATA_USE_HIP
         }
         if (v_out16) {
             const uint32_t v4 = __ldg((const uint32_t*) (vc + src_off) + d4);
             const float2 f0 = e4m3fnx2_to_f2((uint16_t) (v4 & 0xFFFFu));
             const float2 f1 = e4m3fnx2_to_f2((uint16_t) (v4 >> 16));
+#if defined(STRATA_USE_HIP)
+            ((uint2*) (v_out16 + dst_off))[d4] =
+                make_uint2(f2h_mul(f0.x, v_inv_scale) | (uint32_t) f2h_mul(f0.y, v_inv_scale) << 16,
+                           f2h_mul(f1.x, v_inv_scale) | (uint32_t) f2h_mul(f1.y, v_inv_scale) << 16);
+#else
             ((uint2*) (v_out16 + dst_off))[d4] = make_uint2(f2_to_u32(f0.x * v_inv_scale, f0.y * v_inv_scale),
                                                             f2_to_u32(f1.x * v_inv_scale, f1.y * v_inv_scale));
+#endif  // STRATA_USE_HIP
         }
     }
 }
@@ -3711,8 +3739,13 @@ __global__ void unpack_kv_fp8_to_f16_kernel(const uint8_t* kc, const uint8_t* vc
         const int d = (int) (idx % (size_t) KD);
         const int slot = kv_row_index(k0 + j, kv_cap, page_table);
         const size_t src = (size_t) slot * KD + d;
+#if defined(STRATA_USE_HIP)
+        if (k_out16) k_out16[idx] = f2h_mul(e4m3fn_to_f32(kc[src]), k_inv_scale);
+        if (v_out16) v_out16[idx] = f2h_mul(e4m3fn_to_f32(vc[src]), v_inv_scale);
+#else
         if (k_out16) k_out16[idx] = f2h(e4m3fn_to_f32(kc[src]) * k_inv_scale);
         if (v_out16) v_out16[idx] = f2h(e4m3fn_to_f32(vc[src]) * v_inv_scale);
+#endif  // STRATA_USE_HIP
     }
 }
 
@@ -3757,6 +3790,7 @@ __device__ __forceinline__ bool mv_conv_row(const MvConv& cv, int row, float x_n
 // Quantized planar Q8 GEMM for the small verify/prefill tiles. One scale covers
 // both 16-wide MMA instructions. Packing the signed bytes via 1024+u is exact
 // for all 256 inputs; the product rounds to half as in decode_q8p_f16_kernel.
+#if !defined(STRATA_USE_HIP)   // (AMD: the PTX tensor-core path is not built)
 template <int Splits>
 __global__ void q8_mma_tile(const int8_t* q, const uint16_t* scales, int N, int K, const uint16_t* x, int T, float* out,
                             int ldy) {
@@ -3805,6 +3839,7 @@ __global__ void q8_mma_tile(const int8_t* q, const uint16_t* scales, int N, int 
     }
 }
 
+#endif  // !STRATA_USE_HIP
 template <int WARPS, int StaticK = 0>
 __global__ void mv_q8p_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, int N, int runtime_k,
                               const float* __restrict__ x, float* y, MvConv c0, MvConv c1, MvAlt a0, MvAlt a1) {
@@ -4448,6 +4483,7 @@ unsigned grid(size_t n, int b = kBlk) { return (unsigned) ((n + b - 1) / b); }
 // ---- the block path: a few tokens at once (2 .. 8, a speculative step's verify window) on the resident path
 
 // the keys of a window of T tokens at pos0 .. pos0 + T - 1: steps of 16 from the first token's k_lo to the last token
+#if !defined(STRATA_USE_HIP)   // (AMD: the PTX tensor-core path is not built)
 __device__ __forceinline__ int wa_active_block(int pos0, int T, int window, int nw, int& k_lo, int& n_steps) {
     k_lo = window < (1 << 30) ? max(0, pos0 - window + 1) : 0;
     n_steps = (pos0 + T - k_lo + 15) >> 4;
@@ -4718,6 +4754,7 @@ __global__ void attn_block_combine_kernel(const float* __restrict__ o_part, cons
 
 // a few tokens' short conv (conv4_fused_kernel's arithmetic) with row strides; the history before and the inputs
 // kept for a rollback (rec_old [3][C], rec_x [T][C]: conv_hist_after's) when given
+#endif  // !STRATA_USE_HIP
 __global__ void conv_block_kernel(const float* __restrict__ x, int x_ld, float* hist, const float* __restrict__ w,
                                   const float* __restrict__ dyn, int d_ld, int heads, int T, int C,
                                   const float* __restrict__ res, int res_ld, float* y, int y_ld, float* rec_old,
@@ -4826,6 +4863,7 @@ __global__ void prep_qkv_r_slots_kernel(float* q, int q_ld, const float* q_clip,
     }
 }
 
+#if !defined(STRATA_USE_HIP)   // (AMD: the PTX tensor-core path is not built)
 template <class KVT>
 __global__ void __launch_bounds__(kWaNW * 32, 4)
 attn_slots_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__ kc_base,
@@ -5059,6 +5097,7 @@ __global__ void attn_slots_mma_combine_kernel(const float* __restrict__ o_part, 
     out[oix] = res;
     if (out16) out16[oix] = f2h(res);
 }
+#endif  // !STRATA_USE_HIP
 
 // every short conv's history as after the first n of a window's tokens, all the layers' convs in one launch
 __global__ void rollback_block_kernel(const ConvRec* __restrict__ recs, int n) {
@@ -5143,6 +5182,7 @@ __global__ void group_route_kernel(const int* __restrict__ top, const float* __r
 // gate rows and the same 8 of up, SPLIT warps each a stride of the 64-value blocks; the B columns are (member,
 // limb) pairs - column c the member c / 2's limb c % 2 of its input (limbs [T][2][C]) - NT tiles of 8 (members <=
 // 4 NT), so that the members' products read the expert's rows once.  h [slot][F] = SwiGLU of the member's rows.
+#if !defined(STRATA_USE_HIP)   // (AMD: the PTX tensor-core path is not built)
 template <int SPLIT, int NT>
 __global__ void __launch_bounds__(SPLIT * 32)
 experts_block_gu_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ n_g, const int* __restrict__ tok_g,
@@ -5270,6 +5310,7 @@ experts_block_down_kernel(const uint8_t* const* __restrict__ blob, const int* __
 
 
 // route() for a window, a block of E threads a token (route_token_kernel's picks: the same weights to the bit)
+#endif  // !STRATA_USE_HIP
 __global__ void route_rows_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int E, int K,
                                   float scale, int* top, float* w) {
     extern __shared__ float rr_sm[];
@@ -5322,6 +5363,7 @@ __device__ __forceinline__ Q8Step q8_step_load(const uint8_t* a, const uint8_t* 
 // experts_block_gu_kernel over Q8_0 blocks: a block's two MMA (values 8 t .. + 3, 8 t + 4 .. + 7 of the lane, B
 // taken in the same order) into a sum of its own, scaled by the row's block scale in FP32 - the int8 values exact
 // in FP16, nothing rounded but the input's limbs
+#if !defined(STRATA_USE_HIP)   // (AMD: the PTX tensor-core path is not built)
 template <int SPLIT, int NT>
 __global__ void __launch_bounds__(SPLIT * 32)
 experts_block_gu_q8_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ n_g, const int* __restrict__ tok_g,
@@ -5438,6 +5480,7 @@ experts_block_down_q8_kernel(const uint8_t* const* __restrict__ blob, const int*
     }
 }
 
+#endif  // !STRATA_USE_HIP
 }  // namespace
 
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s) {
@@ -5552,6 +5595,7 @@ void attn_probs_bias_f16(const float* lg, uint16_t* out16, int H, int Tq, int nk
     check("attn_probs_bias_f16");
 }
 // the Hopper kernel (wgmma) on a 9.x GPU of a build with sm_90a; IK2_WGMMA=0: the mma.sync one everywhere
+#if !defined(STRATA_USE_HIP)   // (AMD: the PTX tensor-core path is not built)
 bool fa_wgmma() {
     static const int on = [] {
         if (getenv("IK2_WGMMA") && !std::atoi(getenv("IK2_WGMMA"))) return 0;
@@ -5622,12 +5666,17 @@ void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint
                                                                                  out, o_ld, v_inv_scale);
     check("attn_flash_combine");
 }
+#endif  // !STRATA_USE_HIP
+#if !defined(STRATA_USE_HIP)   // (AMD: the PTX tensor-core path is not built)
 int attn_flash_splits(int Tq, int H, int nk, int n_sm) {
     const int blocks = (Tq + 16 * kFaNW - 1) / (16 * kFaNW) * H;
     const int want = (6 * n_sm + blocks - 1) / blocks;   // (about three waves of two blocks an SM)
     const int most = std::max(1, (nk + 16 * kFaBN - 1) / (16 * kFaBN));   // (>= 1024 keys a split)
     return std::max(1, std::min({want, most, 16}));
 }
+#else
+int attn_flash_splits(int, int, int, int) { return 1; }   // (HIP: the flash path is compiled out)
+#endif  // !STRATA_USE_HIP
 void attn_probs_f16(const float* lg, uint16_t* out16, int H, int Tq, int nk, int qpos0, int kpos0, float qk_scale,
                     const float* r, int d_rel, const float* proj, int extent, int window, const float* sink,
                     cudaStream_t s) {
@@ -5957,6 +6006,7 @@ void expert_limb_mv(bool gate, const uint8_t* const* blob, size_t offset, int C,
     }
     check("nv_expert_limb");
 }
+#if !defined(STRATA_USE_HIP)   // (AMD: the PTX tensor-core path is not built)
 bool experts_mma_fits(int ty_gate, int ty_up, int ty_down, int C, int F) {
     return ty_gate == kNVFP4 && ty_up == kNVFP4 && ty_down == kNVFP4 && C % 64 == 0 && F % 64 == 0;
 }
@@ -5993,6 +6043,7 @@ void experts_down_mma(const uint8_t* const* blob, int S, size_t off_down, const 
     launch_experts_mma<false>(blob, S, off_down, h, F, C, F, nullptr, nullptr, 0.0f, 0.0f, nullptr, y, s);
     check("experts_down_mma");
 }
+#endif  // !STRATA_USE_HIP
 void experts_gate_up(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
                      const float* x, int C, int F, float* gu, cudaStream_t s) {
     if (S <= 0) return;
@@ -6024,19 +6075,23 @@ void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, in
                     const uint16_t* h, int C, int F, float* y, cudaStream_t s) {
     if (G <= 0) return;
     static const bool use_group_mma = getenv("IK2_GROUP_MMA") && (atoi(getenv("IK2_GROUP_MMA")) & 2);
+#if !defined(STRATA_USE_HIP)   // (AMD: the PTX tensor-core path is not built)
     if (grouped_tensor_products && use_group_mma && ty_down == kNVFP4 && C % 16 == 0 && F % 64 == 0) {
         grouped_expert_mma<false, 4><<<dim3(C / 16, G), 128, 0, s>>>(blob, nullptr, off_down, C, F, h, nullptr, y,
                                                                      nullptr, nullptr, 0, 0, n, row);
         check("grouped_expert_mma (grouped)");
         return;
     }
+#endif  // !STRATA_USE_HIP
 
+#if !defined(STRATA_USE_HIP)   // (AMD: the PTX tensor-core path is not built)
     if (grouped_tensor_products && use_group_mma && ty_down == kQ8_0 && C % 16 == 0 && F % 32 == 0) {
         grouped_expert_mma<false, 4, true><<<dim3(C / 16, G), 128, 0, s>>>(blob, nullptr, off_down, C, F, h, nullptr, y,
                                                                            nullptr, nullptr, 0, 0, n, row);
         check("q8 grouped MMA");
         return;
     }
+#endif  // !STRATA_USE_HIP
     const dim3 g((unsigned) ((C + kGroupWarps * kGroupRows - 1) / (kGroupWarps * kGroupRows)), (unsigned) G);
     experts_down_g_kernel<<<g, kGroupWarps * 32, 0, s>>>(blob, n, row, ty_down, off_down, h, C, F,
                                                          mv_row_bytes(ty_down, F), y);
@@ -6078,19 +6133,23 @@ void experts_gate_up_swiglu_g(const uint8_t* const* blob, const int* n, const in
                               const uint16_t* input16) {
     if (G <= 0) return;
     static const bool use_group_mma = getenv("IK2_GROUP_MMA") && (atoi(getenv("IK2_GROUP_MMA")) & 1);
+#if !defined(STRATA_USE_HIP)   // (AMD: the PTX tensor-core path is not built)
     if (grouped_tensor_products && use_group_mma && input16 && ty_gate == kNVFP4 && ty_up == kNVFP4 && F % 8 == 0 && C % 64 == 0) {
         grouped_expert_mma<true, 4><<<dim3(F / 8, G), 128, 0, s>>>(blob, tok, eb0, C, F, nullptr, h, nullptr, sg, su,
                                                                    gcap, ucap, n, row, input16);
         check("grouped_expert_mma (grouped)");
         return;
     }
+#endif  // !STRATA_USE_HIP
 
+#if !defined(STRATA_USE_HIP)   // (AMD: the PTX tensor-core path is not built)
     if (grouped_tensor_products && use_group_mma && input16 && ty_gate == kQ8_0 && ty_up == kQ8_0 && F % 8 == 0 && C % 32 == 0) {
         grouped_expert_mma<true, 4, true><<<dim3(F / 8, G), 128, 0, s>>>(blob, tok, eb0, C, F, nullptr, h, nullptr, sg,
                                                                          su, gcap, ucap, n, row, input16);
         check("q8 grouped MMA");
         return;
     }
+#endif  // !STRATA_USE_HIP
     const dim3 g((unsigned) ((F + kGroupWarps * kGroupSwigluRows - 1) / (kGroupWarps * kGroupSwigluRows)), (unsigned) G);
     experts_gate_up_swiglu_g_kernel<<<g, kGroupWarps * 32, 0, s>>>(blob, n, tok, row, ty_gate, ty_up, eb0, x, C, F,
                                                                    mv_row_bytes(ty_gate, C), mv_row_bytes(ty_up, C),
@@ -6229,12 +6288,14 @@ void attn_decode_fp8(const float* q, const float* r, const float* sink, const ui
                      window, scratch, out, s, page_table);
 }
 
+#if !defined(STRATA_USE_HIP)   // (AMD: the PTX tensor-core path is not built)
 void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x, int T, float* y, int ldy,
              cudaStream_t s) {
     q8_mma_tile<4><<<dim3((N + 15) / 16, (T + 7) / 8), 128, 0, s>>>(q, d, N, K, x, T, y, ldy);
     check("q8_mma_tile");
 }
 
+#endif  // !STRATA_USE_HIP
 void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
                  const MvConv& c1, cudaStream_t s, const MvAlt& a0, const MvAlt& a1) {
     if (N <= 0) return;
@@ -6339,6 +6400,7 @@ void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const
     check("attn_decode_fp8_at (combine)");
 }
 
+#if !defined(STRATA_USE_HIP)   // (AMD: the PTX tensor-core path is not built)
 int attn_decode_mma_blocks(int Hkv) {
     int dev = 0, n_sm = 0, occ16 = 0, occ8 = 0;
     cudaGetDevice(&dev);
@@ -6385,6 +6447,7 @@ void attn_decode_mma_fp8(const uint16_t* q16, const float* r, const float* sink,
                          extent, window, scratch, out, gate, out16, s, page_table);
 }
 
+#endif  // !STRATA_USE_HIP
 void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk, int KD,
                           float k_inv_scale, float v_inv_scale, uint16_t* k_out16, uint16_t* v_out16,
                           cudaStream_t s, const int* page_table) {
@@ -6444,6 +6507,7 @@ void decode_host(int type, const uint8_t* blocks, size_t n, float* out) {
 
 // ---- the block path's launchers
 
+#if !defined(STRATA_USE_HIP)   // (AMD: the PTX tensor-core path is not built)
 template <class KV, int NT>
 static void attn_block_launch(const uint16_t* q16, const float* r, int r_ld, const float* sink, const KV* kc,
                               const KV* vc, int kv_cap, int H, int Hkv, const int* pos, int T, int n_split,
@@ -6501,6 +6565,7 @@ void attn_block_fp8(const uint16_t* q16, const float* r, int r_ld, const float* 
 }
 size_t attn_block_scratch(int H, int T, int n_split) { return (size_t) n_split * kWaNW * T * H * (kFaD + 2); }
 
+#endif  // !STRATA_USE_HIP
 void conv_block(const float* x, int x_ld, float* hist, const float* w, const float* dyn, int d_ld, int heads, int T,
                 int C, const float* res, int res_ld, float* y, int y_ld, float* rec_old, float* rec_x,
                 cudaStream_t s) {
@@ -6535,6 +6600,7 @@ void group_route(const int* top, const float* w, int S, int K, const uint8_t* co
     group_route_kernel<<<1, 64, 0, s>>>(top, w, S, K, tab, sg_t, su_t, sd_t, blob, n, tok, row, sg, su, wt, inv);
     check("group_route");
 }
+#if !defined(STRATA_USE_HIP)   // (AMD: the PTX tensor-core path is not built)
 void experts_block_gu(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,
                       size_t off_up, int C, int F, const uint16_t* limbs, const float* sg, const float* su, float gcap,
                       float ucap, uint16_t* h, cudaStream_t s) {
@@ -6551,6 +6617,7 @@ void experts_block_down(const uint8_t* const* blob, const int* n, const int* row
                                                                                          h, y);
     check("experts_block_down");
 }
+#endif  // !STRATA_USE_HIP
 void prep_qkv_r_fp8_block(float* q, int q_ld, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in,
                           uint8_t* vc, float* r, int r_ld, const float* r_clip, int T, int H, int KV, int D, int d_rel,
                           float qk_clip, float rel_clip, float eps, const int* pos, bool log_scale, float alpha,
@@ -6589,6 +6656,7 @@ void route_rows(const float* logits, const float* bias, int T, int E, int K, flo
                                                                                                scale, top, w);
     check("route_rows");
 }
+#if !defined(STRATA_USE_HIP)   // (AMD: the PTX tensor-core path is not built)
 void experts_block_gu_q8(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,
                          size_t off_up, int C, int F, const uint16_t* limbs, const float* sg, const float* su,
                          float gcap, float ucap, uint16_t* h, cudaStream_t s) {
@@ -6605,6 +6673,7 @@ void experts_block_down_q8(const uint8_t* const* blob, const int* n, const int* 
                                                                                             F, h, y);
     check("experts_block_down_q8");
 }
+#endif  // !STRATA_USE_HIP
 
 void conv_slots(const float* x, int x_ld, float* hist_base, const int* slot_ids, const float* w, const float* dyn,
                 int d_ld, int heads, int B, int C, const float* res, int res_ld, float* y, int y_ld, cudaStream_t s) {
@@ -6642,6 +6711,7 @@ void prep_qkv_r_f16_slots(float* q, int q_ld, const float* q_clip, const float* 
     check("prep_qkv_r_f16_slots");
 }
 
+#if !defined(STRATA_USE_HIP)   // (AMD: the PTX tensor-core path is not built)
 size_t attn_slots_scratch(int H, int B, int n_split) { return (size_t) B * n_split * kWaNW * H * (kFaD + 2); }
 
 template <class KV>
@@ -6689,4 +6759,68 @@ void attn_slots_f16(const uint16_t* q16, const float* r, int r_ld, const float* 
                               gate_ld, out16, s);
 }
 
+#endif  // !STRATA_USE_HIP
+#if defined(STRATA_USE_HIP)
+// AMD (HIP): the tensor-core (PTX) entry points exist only as hard errors; main() refuses the settings that pick them.
+[[noreturn]] static void tc_out(const char* what) {
+    std::fprintf(stderr, "ik2: %s is a tensor-core path, not in the AMD build\n", what);
+    std::abort();
+}
+void attn_flash_f16(const uint16_t*, int, const uint16_t*, const uint16_t*, int, int, int,
+                    int, int, int, float, const float*, int, int,
+                    const float*, float*, int, float*, size_t, int,
+                    cudaStream_t, const int*) { tc_out("attn_flash_f16"); }
+void attn_flash_fp8(const uint16_t*, int, const uint8_t*, const uint8_t*, int, int, int,
+                    int, int, int, float, float, const float*, int,
+                    int, const float*, float*, int, float*, size_t,
+                    int, cudaStream_t, const int*) { tc_out("attn_flash_fp8"); }
+bool experts_mma_fits(int, int, int, int, int) { return false; }
+void experts_gate_up_swiglu_mma(const uint8_t* const*, int, size_t, const uint16_t*, int, int,
+                                const float*, const float*, float, float, uint16_t*, cudaStream_t) { tc_out("experts_gate_up_swiglu_mma"); }
+void experts_down_mma(const uint8_t* const*, int, size_t, const uint16_t*, int, int, float*,
+                      cudaStream_t) { tc_out("experts_down_mma"); }
+void q8_tile(const int8_t*, const uint16_t*, int, int, const uint16_t*, int, float*, int,
+             cudaStream_t) { tc_out("q8_tile"); }
+int attn_decode_mma_blocks(int) { return 1; }
+size_t attn_decode_mma_scratch(int, int) { return 0; }
+void attn_decode_mma_f16(const uint16_t*, const float*, const float*, const uint16_t*, const uint16_t*,
+                         int, int, int, const int*, int, int, float,
+                         const float*, int, int, int, float*, float*,
+                         const float*, uint16_t*, cudaStream_t, const int*) { tc_out("attn_decode_mma_f16"); }
+void attn_decode_mma_fp8(const uint16_t*, const float*, const float*, const uint8_t*, const uint8_t*,
+                         int, int, int, const int*, int, int, float,
+                         float, const float*, int, int, int, float*,
+                         float*, const float*, uint16_t*, cudaStream_t, const int*) { tc_out("attn_decode_mma_fp8"); }
+void attn_block_f16(const uint16_t*, const float*, int, const float*, const uint16_t*,
+                    const uint16_t*, int, int, int, const int*, int, int, float,
+                    const float*, int, int, int, float*, float*,
+                    const float*, int, uint16_t*, cudaStream_t) { tc_out("attn_block_f16"); }
+void attn_block_fp8(const uint16_t*, const float*, int, const float*, const uint8_t*,
+                    const uint8_t*, int, int, int, const int*, int, int, float,
+                    float, const float*, int, int, int, float*,
+                    float*, const float*, int, uint16_t*, cudaStream_t) { tc_out("attn_block_fp8"); }
+size_t attn_block_scratch(int, int, int) { return 0; }
+void experts_block_gu(const uint8_t* const*, const int*, const int*, const int*, int, int,
+                      size_t, int, int, const uint16_t*, const float*, const float*, float,
+                      float, uint16_t*, cudaStream_t) { tc_out("experts_block_gu"); }
+void experts_block_down(const uint8_t* const*, const int*, const int*, int, size_t, int,
+                        int, const uint16_t*, float*, cudaStream_t) { tc_out("experts_block_down"); }
+void experts_block_gu_q8(const uint8_t* const*, const int*, const int*, const int*, int, int,
+                         size_t, int, int, const uint16_t*, const float*, const float*,
+                         float, float, uint16_t*, cudaStream_t) { tc_out("experts_block_gu_q8"); }
+void experts_block_down_q8(const uint8_t* const*, const int*, const int*, int, size_t, int,
+                           int, const uint16_t*, float*, cudaStream_t) { tc_out("experts_block_down_q8"); }
+size_t attn_slots_scratch(int, int, int) { return 0; }
+void attn_slots_fp8(const uint16_t*, const float*, int, const float*, const uint8_t*, const uint8_t*, int, int, int,
+                    const int*, const int*, const int*, int, int, int, float, float, const float*, int, int, int,
+                    float*, float*, const float*, int, uint16_t*, cudaStream_t) { tc_out("attn_slots_fp8"); }
+void attn_slots_f16(const uint16_t*, const float*, int, const float*, const uint16_t*, const uint16_t*, int, int, int,
+                    const int*, const int*, const int*, int, int, int, float, const float*, int, int, int, float*,
+                    float*, const float*, int, uint16_t*, cudaStream_t) { tc_out("attn_slots_f16"); }
+// the AMD build's own kernels (wave32 RDNA 3 / 3.5, measured on gfx1151): docs/AMD_INKLING2_GFX1151.md
+#include "ik2_fuse.inc"      // IK2_FUSE_MASK: the resident decode's small kernels, fewer and shorter
+#include "ik2_experts2.inc"  // IK2_FUSE_MASK 0x1000..0x8000: batch-1 expert GEMVs, x in registers
+#include "ik2_hbpf.inc"      // IK2_HBPF: prefill kernels ported from headbouyJB/inkling2-gufo (MIT)
+#include "ik2_dsc.inc"       // IK2_DSC: the exact verify window of --draft
+#endif  // STRATA_USE_HIP
 }  // namespace ik2::k

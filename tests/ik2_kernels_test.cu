@@ -2931,15 +2931,25 @@ int main() {
     test_round2_fused();
     test_fp8_kv();
     test_round6();
+#if defined(STRATA_USE_HIP)   // (the AMD build has no tensor-core paths: ik2_kernels.cu)
+    std::printf("test_attn_flash, test_attn_decode_mma: skipped (tensor-core paths, not in the AMD build)\n");
+#else
     test_attn_flash();   // (last: its random data leaves the others' as they were)
     test_attn_decode_mma();
+#endif  // STRATA_USE_HIP
     test_cand_topk();
     test_token_path();
     test_expert_limbs();
+#if defined(STRATA_USE_HIP)
+    std::printf("test_experts_mma, test_q8_verify_tile, test_attn_slots: skipped (tensor-core paths, not in the AMD "
+                "build)\n");
+    test_conv_slots();
+#else
     test_experts_mma();
     test_q8_verify_tile();
     test_conv_slots();
     test_attn_slots();
+#endif  // STRATA_USE_HIP
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
