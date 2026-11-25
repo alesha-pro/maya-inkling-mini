@@ -7164,6 +7164,33 @@ int main(int argc, char** argv) {
                 (unsigned long long) ec_sum([](ExpertCache& e) { return e.hits; }),
                 (unsigned long long) ec_sum([](ExpertCache& e) { return e.misses; }),
                 ec_sum([](ExpertCache& e) { return e.bytes_up; }) / 1073741824.0);
+    if (getenv("IK2_KV_HASH") && std::atoi(getenv("IK2_KV_HASH"))) {
+        // (diagnostic) every visit's K / V cache after the prompt, hashed on the host: run-to-run bit differences
+        // anywhere in the prefill show here without the syncs a per-layer hash adds
+        CU(cudaDeviceSynchronize());
+        const size_t KD = (size_t) M.c.KV * M.c.D;
+        uint64_t all = 1469598103934665603ull;
+        std::string per;
+        std::vector<uint64_t> buf;
+        for (const auto& Vi : M.V) {
+            uint64_t h = 1469598103934665603ull;
+            for (int kv = 0; kv < 2; ++kv) {
+                const void* p = g_kv_fp8 ? (const void*) (kv ? Vi.vc8 : Vi.kc8) : (const void*) (kv ? Vi.vc : Vi.kc);
+                // (only the rows the prompt wrote: the rest is uninitialised)
+                const size_t rows = std::min((size_t) Vi.kv_cap, prompt.size());
+                const size_t bytes = rows * KD * (g_kv_fp8 ? 1 : 2);
+                if (!p || !bytes) continue;
+                buf.assign((bytes + 7) / 8, 0);
+                CU(cudaMemcpy(buf.data(), p, bytes, cudaMemcpyDeviceToHost));
+                for (uint64_t w : buf) h = (h ^ w) * 1099511628211ull;
+            }
+            all = (all ^ h) * 1099511628211ull;
+            char s[12];
+            std::snprintf(s, sizeof s, " %08x", (unsigned) (h ^ (h >> 32)));
+            per += s;
+        }
+        std::printf("kv-hash %016llx visits%s\n", (unsigned long long) all, per.c_str());
+    }
     std::fflush(stdout);
     if (all) {
         // log-probabilities of every prompt position

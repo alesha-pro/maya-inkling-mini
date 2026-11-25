@@ -2717,6 +2717,7 @@ Engine flags: `--max-context N` (262144), `--parallel N` (1: up to 8 concurrent 
 | `IK2_DENSE` | FP16; `q8` when every expert stays in VRAM | `q8`: the dense weights kept as the GGUF's Q8_0 blocks (half an FP16 copy's bytes), a token's products straight over them, planar (`mv_q8p`); a prompt chunk decodes a matrix to FP16 for its GEMM. `f16`: the FP16 copy |
 | `IK2_PROF`, `IK2_STATS` | off | each request's time by phase; where its experts came from (cached, prefetched, copied on a miss, the CPU) |
 | `IK2_TRACE`, `IK2_POP_OUT`, `IK2_FORCE`, `IK2_LOGITS_OUT`, `IK2_MARGIN`, `IK2_VERIFY_CHECK`, `IK2_UP_MS`, `IK2_ALLOC_THREADS` | off | measurement: every layer's picks to a file; the pick counts (for `IK2_WARM`); fixed tokens fed (`--tokens` runs: two builds compared on the same text, and how often each one's pick agrees); every generated token's logits to a file (with `IK2_FORCE`: two builds' logits over the same tokens); the drafter's checks (`--draft`); the CPU lane's estimate of an expert's copy time; threads allocating host memory |
+| `IK2_KV_HASH` | off | `1`: measurement - after the prompt, every visit's K / V cache (the rows the prompt wrote) hashed on the host and printed as `kv-hash` (all of them, then one a visit). Two runs or two builds with the same hash read the prompt bit for bit alike, without the syncs a per-layer trace adds |
 
 ## GLM-5.3 (744B)
 
