@@ -1738,7 +1738,10 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                                 CUDA_R_32F, c.d_rel, r_p + (size_t) ts * HR, CUDA_R_32F, c.d_rel, &zero_f, W.relb,
                                 CUDA_R_32F, extent, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
                 const int k_lo = Ly.sliding ? std::max(0, pos0 + ts - c.window + 1) : 0;
-                const int ns = k::attn_flash_splits(Tq, c.H, pos0 + ts + Tq - k_lo, g_n_sm);
+                // IK2_FLASH_SPLITS=n (1 .. 16): every flash prefill call that many key splits instead of
+                // attn_flash_splits' pick (an A/B of that heuristic; the scratch still caps it)
+                static const int flash_ns = getenv("IK2_FLASH_SPLITS") ? std::clamp(atoi(getenv("IK2_FLASH_SPLITS")), 0, 16) : 0;
+                const int ns = flash_ns ? flash_ns : k::attn_flash_splits(Tq, c.H, pos0 + ts + Tq - k_lo, g_n_sm);
                 if (g_kv_fp8)
                     k::attn_flash_fp8(W.x16 + (size_t) ts * HD, HD, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, Tq,
                                       pos0 + ts, qk_scale * k_inv, v_inv, W.relb, extent, window,

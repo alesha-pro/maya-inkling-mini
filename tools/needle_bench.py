@@ -8,7 +8,7 @@ API (thinking off, greedy). One line per test: length, depth, found or not, prom
     python tools/needle_bench.py --lengths 32k,128k,262k --depths 10,50,90 --url http://127.0.0.1:8081
     python tools/needle_bench.py --out needles.json --api-key KEY
 
-The lengths are targets, 2% under so that "128k" fits a 128K context: the text is cut by characters (about 3.2 per
+The lengths are targets, 2% under so that "128k" fits a 128K context: the text is cut by characters (about 3.1 per
 token), and the line reports the prompt's real token count from the server. A length the server's context cannot hold is skipped.
 """
 from __future__ import annotations
@@ -27,7 +27,7 @@ SOURCES = [("docs", "*.md"), ("src", "*.cpp"), ("src", "*.cu"), ("include", "*.h
            ("third_party/llama.cpp/docs", "*.md")]
 WORDS = ["amber", "falcon", "quartz", "willow", "copper", "harbor", "saffron", "glacier", "orchid", "lantern",
          "meadow", "cobalt", "juniper", "tundra", "velvet", "ember"]
-CHARS_PER_TOKEN = 3.2
+CHARS_PER_TOKEN = 3.1                                 # (measured 3.13-3.17 on this haystack with Inkling's tokenizer)
 
 
 def haystack(n_chars: int) -> str:
@@ -35,6 +35,8 @@ def haystack(n_chars: int) -> str:
     files = []
     for d, pat in SOURCES:
         files += sorted((ROOT / d).rglob(pat))
+    # (not this file: it holds the needle's own sentence - a decoy without a code word in the haystack)
+    files = [f for f in files if f.resolve() != Path(__file__).resolve()]
     parts, total = [], 0
     while total < n_chars:
         for f in files:

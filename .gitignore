@@ -62,3 +62,4 @@ build-vision.bat
 /data/hy4-cpu-lane.txt
 /data/hy4-cpu-lane.txt.new
 /data/vram-room.json
+!/bench/ab/results/**/*.log
