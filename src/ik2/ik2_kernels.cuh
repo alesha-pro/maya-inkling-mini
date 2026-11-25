@@ -200,6 +200,29 @@ void experts_down_mma(const uint8_t* const* blob, int S, size_t off_down, const 
                       cudaStream_t s);
 void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_down, const uint16_t* h, int C, int F,
                   float* y, cudaStream_t s);
+#if defined(STRATA_USE_HIP)
+/// IK2_FUSE_MASK 0x1000 / 0x2000 (ik2_experts2.inc): experts_gate_up_swiglu / experts_down for NVFP4 experts at
+/// C 2304, F 1152 (experts_nv_fits), x in registers - the same values to the bit (tests/ik2_experts_test.cu)
+bool experts_nv_fits(int ty_gate, int ty_up, int ty_down, int C, int F);
+void experts_gate_up_swiglu_nv(const uint8_t* const* blob, const int* tok, int S, size_t eb0, const float* x, int C,
+                               int F, const float* sg, const float* su, float gcap, float ucap, uint16_t* h,
+                               cudaStream_t s);
+void experts_down_nv(const uint8_t* const* blob, int S, size_t off_down, const uint16_t* h, int C, int F, float* y,
+                     cudaStream_t s);
+/// IK2_FUSE_MASK 0x8000 (set 16): a visit's NVFP4 gate_up + down (sets 13 + 14's tiles) in one launch, down tiles
+/// waiting on per-expert device counters (each expert's last down tile resets them: graph-safe); S <= 8
+void experts_nv_visit(const uint8_t* const* blob, const int* tok, int S, size_t eb0, size_t off_down, const float* x,
+                      int C, int F, const float* sg, const float* su, float gcap, float ucap, uint16_t* h, float* y,
+                      cudaStream_t s);
+int experts_nv_visit_pending();
+/// IK2_FUSE_MASK 0x4000: the same for Q8_0 experts (row_dot's 4-aligned Q8_0 path; experts_q8_fits)
+bool experts_q8_fits(int ty, int C, int F);
+void experts_gate_up_swiglu_q8(const uint8_t* const* blob, const int* tok, int S, size_t eb0, const float* x, int C,
+                               int F, const float* sg, const float* su, float gcap, float ucap, uint16_t* h,
+                               cudaStream_t s);
+void experts_down_q8(const uint8_t* const* blob, int S, size_t off_down, const uint16_t* h, int C, int F, float* y,
+                     cudaStream_t s);
+#endif  // STRATA_USE_HIP
 
 /// y [N] = W [N][K] . x [K] for a dense matrix as the GGUF holds it (rows of `type` blocks: Q8_0, NVFP4, Q5_K, Q6_K),
 /// a warp a row in a fixed order - one token's products, half the bytes of an FP16 copy for Q8_0.  K <= 8192.
@@ -325,6 +348,88 @@ void route_token(const float* logits, const float* bias, int E, int K, float sca
                  const float* sg_t, const float* su_t, const float* sd_t, int* top, float* w, const uint8_t** blob,
                  int* tok, int* inv, float* sg, float* su, float* wt, cudaStream_t s, const float* x = nullptr,
                  int width = 0, void* packed = nullptr, bool q8 = false, uint16_t* x_limbs = nullptr);
+#if defined(STRATA_USE_HIP)
+/// IK2_FUSE=1 (ik2_fuse.inc): the resident path's small kernels, fewer and shorter, the same values to the bit
+/// (tests/ik2_fuse_test.cu).  Each returns false - nothing launched - where its shapes are not the ones it was built
+/// for (rows of 2304, the router's E <= 128, P 16 or 128); the caller then takes the kernels it replaces.
+/// fuse_mv_f16_pair: two mv_f16 products (y0 = W0 x0, y1 = W1 x1, rows of K) in one launch.
+bool fuse_mv_f16_pair(const uint16_t* W0, const float* x0, float* y0, int N0, const uint16_t* W1, const float* x1,
+                      float* y1, int N1, int K, cudaStream_t s);
+/// fuse_router_route: mv_f16 (logits = Wr x, Wr [E][C]) and route_token (no x limbs / packed input) in one launch;
+/// lds (set 6): the rows and x through LDS in 16-byte loads (the same values).
+bool fuse_router_route(const uint16_t* Wr, const float* x, int C, float* logits, const float* bias, int E, int K,
+                       float scale, const uint8_t* const* tab, const float* sg_t, const float* su_t, const float* sd_t,
+                       int* top, float* w, const uint8_t** blob, int* tok, int* inv, float* sg, float* su, float* wt,
+                       cudaStream_t s, bool lds = false);
+/// fuse_prep_qkv_r_f16_at: prep_qkv_r_f16_at, its sinks' loads asked for at once.
+bool fuse_prep_qkv_r_f16_at(float* q, const float* q_clip, const float* k_in, uint16_t* kc, const float* v_in,
+                            uint16_t* vc, float* r, const float* r_clip, int H, int KV, int D, int d_rel, float qk_clip,
+                            float rel_clip, float eps, const int* pos, bool log_scale, float alpha, float n_floor,
+                            int kv_cap, uint16_t* q16, cudaStream_t s, const uint16_t* sink_w, const float* sink_x,
+                            int sink_k, float* sink_y);
+/// fuse_attn_decode_f16_at_gate: attn_decode_f16_at then gate_mul_f16 (out = o sigmoid(gate), out16 its FP16):
+/// the split as is, the combine and the gate in one launch.
+bool fuse_attn_decode_f16_at_gate(const float* q, const float* r, const float* sink, const uint16_t* kc,
+                                  const uint16_t* vc, int kv_cap, int H, int Hkv, const int* pos, int P,
+                                  float qk_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
+                                  const float* gate, float* out, uint16_t* out16, cudaStream_t s, bool skip = false);
+/// (skip, set 7: P 128's combine reads only the splits that hold keys and takes each split's factor once.)
+/// fuse_loop_gates_rms: loop_gates of one token (F32 weights, rank 64, C 2304) and then rms of each gate's y (rj's
+/// job j: x = gate j's y, its weights, its output; rms_multi's or rms's values) in two launches instead of four.
+bool fuse_loop_gates_rms(const LoopGate* gates, int n, int C, int R, float eps, float* sc, const RmsJobs& rj,
+                         float rms_eps, cudaStream_t s, bool wide = false);
+/// (wide, set 8: the apply over 64 channels a block - 36 blocks a gate - each thread's loads before the barrier.)
+/// fuse_attn_one_f16_at_gate: fuse_attn_decode_f16_at_gate's values in one launch (a head's last split block combines).
+bool fuse_attn_one_f16_at_gate(const float* q, const float* r, const float* sink, const uint16_t* kc,
+                               const uint16_t* vc, int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale,
+                               const float* proj, int d_rel, int extent, int window, float* scratch, const float* gate,
+                               float* out, uint16_t* out16, cudaStream_t s);
+/// fuse_moe_attn_res: moe_combine_conv (K 8, C 2304; out = the stream, hist / w / res as moe_combine_conv's) and then
+/// attn_res (outs null: into res_out) or attn_res_rms_f16 (outs given) of one token over st, whose last state is out:
+/// one launch, attn_res_vec4's values.
+bool fuse_moe_attn_res(const float* y, const int* inv, const float* wt, int K, int C, float* hist, const float* w,
+                       const float* res, float* out, const ResStates& st, int n, const float* q, int nq, float res_eps,
+                       float rms_eps, float* res_out, const RmsOuts* outs, cudaStream_t s, bool pf = false);
+/// fuse_attn_res_pf (set 5): attn_res (outs null: into res_out) or attn_res_rms_f16 (outs given) of one token over st
+/// (n <= 6, C 2304), every load of a thread at once; fuse_moe_attn_res's pf: its kernel the same way (n <= 6).
+bool fuse_attn_res_pf(const ResStates& st, int n, const float* q, int nq, int C, float res_eps, float rms_eps,
+                      float* res_out, const RmsOuts* outs, cudaStream_t s);
+/// fuse_res_router_route (set 9): attn_res_rms_f16 of one token (one query, n <= 6; outs.y32 given) and then
+/// fuse_router_route on outs.y32, in one launch - the same values.
+bool fuse_res_router_route(const ResStates& st, int n, const float* q, int C, float res_eps, float rms_eps,
+                           const RmsOuts& outs, const uint16_t* Wr, float* logits, const float* bias, int E, int K,
+                           float scale, const uint8_t* const* tab, const float* sg_t, const float* su_t,
+                           const float* sd_t, int* top, float* w, const uint8_t** blob, int* tok, int* inv, float* sg,
+                           float* su, float* wt, cudaStream_t s);
+/// fuse_res_loop_gate_rms (set 10): attn_res of one token (one query, n <= 6) into res_out, which must be gt.x, and
+/// then fuse_loop_gates_rms of that one gate (rj's job 0) - the residual in the dots' launch; the same values.
+bool fuse_res_loop_gate_rms(const ResStates& st, int n, const float* q, float res_eps, float* res_out,
+                            const LoopGate& gt, int C, int R, float eps, float* sc, const RmsJobs& rj, float rms_eps,
+                            cudaStream_t s, bool wide = false);
+/// fuse_loop_gate_rms_router (set 11): one loop gate (gt.y a scratch apart from gt.x and x_out) whose rms (weights nw)
+/// goes to x_out in the router's launch, then fuse_router_route on x_out - the same values as fuse_loop_gates_rms (rj
+/// {gt.y, nw, x_out}) and fuse_router_route.
+bool fuse_loop_gate_rms_router(const LoopGate& gt, int C, int R, float eps, float* sc, const float* nw, float rms_eps,
+                               float* x_out, const uint16_t* Wr, float* logits, const float* bias, int E, int K,
+                               float scale, const uint8_t* const* tab, const float* sg_t, const float* su_t,
+                               const float* sd_t, int* top, float* w, const uint8_t** blob, int* tok, int* inv,
+                               float* sg, float* su, float* wt, cudaStream_t s);
+/// fuse_loop_gate_router (set 12): fuse_loop_gates_rms of one gate (rj's job 0) and then fuse_router_route on rj.y[0]
+/// - the apply, its rms and the router in one grid (the router blocks wait for the rms on a flag); the same values.
+bool fuse_loop_gate_router(const LoopGate& gt, int C, int R, float eps, float* sc, const RmsJobs& rj, float rms_eps,
+                           const uint16_t* Wr, float* logits, const float* bias, int E, int K, float scale,
+                           const uint8_t* const* tab, const float* sg_t, const float* su_t, const float* sd_t, int* top,
+                           float* w, const uint8_t** blob, int* tok, int* inv, float* sg, float* su, float* wt,
+                           cudaStream_t s);
+/// fuse_prep_attn_f16_at_gate: prep_qkv_r_f16_at (sinks given) + attn_decode_f16_at + gate_mul_f16 of one token in one
+/// launch (P 16: a window layer); the cache, the sinks and out / out16 as theirs; q and r are left unclipped.
+bool fuse_prep_attn_f16_at_gate(const float* q, const float* q_clip, const float* k_in, uint16_t* kc, const float* v_in,
+                                uint16_t* vc, const float* r, const float* r_clip, int H, int KV, int D, int d_rel,
+                                float qk_clip, float rel_clip, float eps, const int* pos, bool log_scale, float alpha,
+                                float n_floor, int kv_cap, const uint16_t* sink_w, const float* sink_x, int sink_k,
+                                float* sink_y, float qk_scale, const float* proj, int extent, int window, int P,
+                                float* scratch, const float* gate, float* out, uint16_t* out16, cudaStream_t s);
+#endif  // STRATA_USE_HIP
 /// prep_qkv_r_f16 / _fp8 of one token whose position is at pos (device): the cache slot from it, and with log_scale
 /// (a full layer) q's and r's tau.  q16 (given): an FP16 copy of the clipped q, [H][D] (attn_decode_mma's).
 /// sink_w (given): the token's sinks in the same launch, sink_y [H] = sink_w [H][sink_k] (FP16) . sink_x (mv_f16's).
@@ -531,4 +636,106 @@ void attn_slots_f16(const uint16_t* q16, const float* r, int r_ld, const float* 
                     int d_rel, int extent, int window, float* scratch, float* out, const float* gate, int gate_ld,
                     uint16_t* out16, cudaStream_t s);
 
+#if defined(STRATA_USE_HIP)
+/// IK2_HBPF (ik2_hbpf.inc: prefill kernels ported from headbouyJB/inkling2-gufo, MIT): f16 WMMA tiles over the blocks
+/// bit 0: the experts of a chunk grouped on the GPU, gate_up + activation and down as two tiled GEMMs, slots summed
+/// in a fixed order (C 2304, F 1152, E 128, K 8; NVFP4 or Q8_0 experts, all three roles one type: hb_moe_fits)
+struct HbMoeWs {
+    int *cnt, *goff, *fill, *nitems, *item_e, *item_start, *item_n, *postok, *pair;
+    float* posw;
+};
+bool hb_moe_fits(int ty_gate, int ty_up, int ty_down, int C, int F, int E, int K);
+void hb_moe_route(const int* ids, const float* w, int S, int tile, const HbMoeWs& ws, cudaStream_t s);
+/// tab: the experts' blobs (gate rows, up rows, then down at off_down); h16 [T K][F] and pairs [T K][C] scratch; y [T][C];
+/// pipe (bit 6): the GEMMs' late-dequant K step (k_gemm4 PIPE), the same result bit for bit;
+/// probe (with pipe, NVFP4, tile 64): 1 / 2 also launch k_gemm4 without fragment reads / without dequant first (a price
+/// in a kernel trace; their output is overwritten); rg (bit 7): the GEMMs as upstream
+/// gufo's routed kernel shape (k_rg), tile 192 or 128 (the items hb_moe_route made), the same sums as k_gemm4
+void hb_moe_prefill(int type, int tile, const uint8_t* const* tab, size_t off_down, const float* sg, const float* su,
+                    const float* sd, float gcap, float ucap, const uint16_t* x16, uint16_t* h16, float* pairs, float* y,
+                    int T, const HbMoeWs& ws, bool pipe, bool rg, int probe, cudaStream_t s);
+/// bit 1: Y [T][ldy] = X16 [T][K] . W^T over a planar Q8_0 matrix (IK2_DENSE q8: int8 [N][K], F16 d [N][K / 32])
+bool hb_dense_fits(int N, int K);
+void hb_dense(const int8_t* q8, const uint16_t* q8d, int N, int K, const uint16_t* x16, int T, float* Y, int ldy,
+              cudaStream_t s);
+/// bit 2: prefill attention over the FP16 cache (slot = pos % cap) after prep_qkv_r_f16: q16 = to_f16(q) [T][H][D],
+/// r [T][H][d_rel], sink [T][H], rel F32 [extent][d_rel]; out [T][H][D] (the gate not applied)
+bool hb_attn_fits(int H, int KV, int D, int d_rel);
+void hb_attn_prefill(const uint16_t* q16, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
+                     int cap, int T, int pos0, int window, int extent, const float* rel, float qk_scale, float* out,
+                     cudaStream_t s);
+/// bit 8 (with bit 2): the same over a turbo6 cache (kc6 / vc6, ring kv_cap as unpack_kv_t6_to_f16;
+/// window (1 << 30) = a full visit): its keys decoded once to FP16 rows k16 / v16 [rows][KV * 128] (unpack_kv_t6_to_f16's
+/// values), then hb_attn_prefill over them - or, a full visit of more than `pass` keys (a multiple of 64, <= rows), in
+/// passes with the softmax state in st (st_floats >= T x 24 x 132), the one call's bits.  hb_attn_t6_plan: 1 one call,
+/// n passes, 0 cannot (the caller's old path; hb_attn_prefill_t6 aborts on it)
+int hb_attn_t6_plan(int T, int pos0, int window, int rows, int pass, size_t st_floats);
+void hb_attn_prefill_t6(const uint16_t* q16, const float* r, const float* sink, const uint8_t* kc6, const uint8_t* vc6,
+                        int kv_cap, int T, int pos0, int window, int extent, const float* rel, float qk_scale,
+                        float* out, uint16_t* k16, uint16_t* v16, int rows, int pass, float* st, size_t st_floats,
+                        cudaStream_t s);
+/// IK2_KV=turbo6 (ik2_turbo6.h / .inc; tubo's 98-byte block, one a 128-value head): caches [kv_cap][KV][98] bytes.
+/// kv_t6_encode: F32 rows k32 / v32 [T][KV][128] -> the blocks at slot (pos + t) % kv_cap (kv_cap 0: pos + t), pos =
+/// *pos_d if given else pos0 - the bytes of ik2::t6::QuantizeBlock.  prep_qkv_r_t6: prep_qkv_r_f16's work (q, r clips,
+/// sinks) with k and v staged in F32 (k_stage, v_stage [T][KV][128]), then kv_t6_encode.  attn_decode_t6: attn_multi /
+/// attn_decode_f16_at over turbo6 caches (pos_d: the replayed graph's position; P splits; scratch nq H P 130 floats).
+/// unpack_kv_t6_to_f16: positions k0 .. k0 + nk - 1 -> FP16 [nk][KV * 128] (the prompt path's GEMMs).
+void kv_t6_encode(const float* k32, const float* v32, uint8_t* kc, uint8_t* vc, int T, int KV, int kv_cap, int pos0,
+                  const int* pos_d, cudaStream_t s);
+void prep_qkv_r_t6(float* q, const float* q_clip, const float* k_in, const float* v_in, float* r, const float* r_clip,
+                   int T, int H, int KV, int D, int d_rel, float qk_clip, float rel_clip, float eps, const int* pos,
+                   float alpha, float n_floor, float* k_stage, float* v_stage, uint8_t* kc, uint8_t* vc, int kv_cap,
+                   int pos0, const int* pos0_d, uint16_t* q16, const uint16_t* sink_w, const float* sink_x,
+                   int sink_k, float* sink_y, cudaStream_t s);
+void attn_decode_t6(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc, int kv_cap,
+                    int nq, int H, int Hkv, int k0, int nk, int qpos0, const int* pos_d, int P, float qk_scale,
+                    const float* proj, int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s);
+void unpack_kv_t6_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk, int Hkv, uint16_t* k16,
+                         uint16_t* v16, cudaStream_t s);
+/// attn_tok_t6: one token's prep_qkv_r_t6 + attn_decode_t6 + gate_mul_f16 (the position at pos; out = o sigmoid(gate),
+/// out16 its FP16), the same bytes and values, a group a block: one_launch (P 16, a window layer) all of it in one
+/// launch, else prep + split + combine (skip: set 7's combine).  q is left rotated (prep), r clipped; scratch H P 130
+/// floats.  false (nothing launched): a shape it does not take (3 q heads a group, D 128, d_rel <= 32, sinks of
+/// C = 2304, P 16 / 128, 16-byte rows) - the caller takes the two calls above.
+bool attn_tok_t6(float* q, const float* q_clip, const float* k_in, const float* v_in, float* r, const float* r_clip,
+                 int H, int KV, int D, int d_rel, float qk_clip, float rel_clip, float eps, const int* pos,
+                 bool log_scale, float alpha, float n_floor, uint8_t* kc, uint8_t* vc, int kv_cap, bool sliding,
+                 const uint16_t* sink_w, const float* sink_x, int sink_k, float* sink_y, float qk_scale,
+                 const float* proj, int extent, int window, int P, bool one_launch, bool skip, float* scratch,
+                 const float* gate, float* out, uint16_t* out16, cudaStream_t s);
+/// bit 4 (ours): up to 3 loop gates over a chunk, each one kernel: y = (1 - tanh(F g)) x + tanh(G g) m with
+/// g = D [rms(x); rms(m)] (eps_gate), then y16 = rms(y) * w (eps_norm) F16, y32 the same F32 when not null; x, m
+/// [T][C] F32 (y32 may be x: a block reads its own rows before it writes them; n 1 then), D [R][2C], F (forget),
+/// G (gain) [R][C]; C 2304, R 64 (hb_ctl_fits)
+struct CtlJob {
+    const float *x, *m, *D, *F, *G, *w;
+    uint16_t* y16;
+    float* y32;
+};
+bool hb_ctl_fits(int C, int R);
+void hb_ctl_prefill(const CtlJob* jobs, int n, int T, float eps_gate, float eps_norm, cudaStream_t s);
+// ---- the exact verify window (ik2_dsc.inc, IK2_DSC=1): every row the single-token decode's float bits
+
+/// mv_q8p for T tokens (1 .. 8): y [t] rows ldy apart = W . x [t] (rows x_ld apart, x_ld % 4 == 0), each token's sums
+/// mv_q8p_kernel's (lane, order, expression, butterfly); a0 / a1 as mv_q8p_conv's (their bounds multiples of 4).
+void mv_q8p_rows(const int8_t* q, const uint16_t* d, int N, int K, const float* x, int x_ld, int T, float* y, int ldy,
+                 cudaStream_t s, const MvAlt& a0 = MvAlt{}, const MvAlt& a1 = MvAlt{});
+/// attn_decode_f16_at + gate_mul_f16 for T queries at pos [T] (device), each split P ways as the decode splits one
+/// token; q / r rows q_ld / r_ld apart, sink [T][H], gate rows gate_ld apart -> out [t] rows o_ld apart (F32, gated).
+/// scratch: T x H x P x 130 floats.
+void attn_rows_f16(const float* q, int q_ld, const float* r, int r_ld, const float* sink, const uint16_t* kc,
+                   const uint16_t* vc, int kv_cap, int H, int Hkv, const int* pos, int T, int P, float qk_scale,
+                   const float* proj, int d_rel, int extent, int window, float* scratch, const float* gate,
+                   int gate_ld, float* out, int o_ld, cudaStream_t s);
+/// route()'s S = T K picks (S <= 64) as slots sorted by (expert, pick): slot tables blob / tok / sg / su by slot,
+/// wt (w times down's scale) and inv (the pick's slot) by pick - moe_combine_f32's.
+void dsc_slots(const int* top, const float* w, int S, int K, const uint8_t* const* tab, const float* sg_t,
+               const float* su_t, const float* sd_t, const uint8_t** blob, int* tok, int* inv, float* sg, float* su,
+               float* wt, cudaStream_t s);
+/// sets 13 + 14 (set 16's tiles) over S slots, the slot the fast grid index: h [S][F], y [S][C] (NVFP4, 2304 / 1152).
+void experts_rows_nv(const uint8_t* const* blob, const int* tok, int S, size_t eb0, size_t off_down, const float* x,
+                     int C, int F, const float* sg, const float* su, float gcap, float ucap, uint16_t* h, float* y,
+                     cudaStream_t s);
+
+#endif  // STRATA_USE_HIP
 }  // namespace ik2::k

@@ -11,6 +11,9 @@
 //     real model's seams cover them.)
 #include "../src/ik2/ik2_iq_tables.h"
 #include "../src/ik2/ik2_kernels.cuh"
+#if defined(STRATA_USE_HIP)
+#include "../src/ik2/ik2_turbo6.h"
+#endif  // STRATA_USE_HIP
 
 #include <cuda_fp16.h>
 
@@ -2906,12 +2909,249 @@ void test_attn_slots() {
         cudaFree(dsw);
 }
 
+#if defined(STRATA_USE_HIP)
+// IK2_KV=turbo6 (src/ik2/ik2_turbo6.inc): the encoder's bytes = ik2::t6::QuantizeBlock's (tubo's CPU reference), the unpack = the CPU decode rounded to FP16, the reader = attn_decode
+// over the CPU-decoded F32 cache (full context; a sliding window over a ring of slots)
+void test_turbo6() {
+    namespace t6 = ik2::t6;
+    const int KV = 8, H = 24, KD = KV * 128, d_rel = 16, extent = 1024;
+    {   // 1. encode T tokens' rows into ring slots
+        const int T = 5, kv_cap = 8, pos0 = 6;
+        auto k32 = fvec((size_t) T * KD, 2.0f), v32 = fvec((size_t) T * KD, 2.0f);
+        for (int i = 0; i < 128; ++i) k32[i] = 0.0f;   // a zero block (norm under the guard)
+        for (int i = 0; i < 128; ++i) v32[128 + i] *= 1e4f;   // a norm past FP16 (inf stored, as the reference)
+        float *dk32 = dev(k32), *dv32 = dev(v32);
+        uint8_t *dk = dev_n<uint8_t>((size_t) kv_cap * KV * 98), *dv = dev_n<uint8_t>((size_t) kv_cap * KV * 98);
+        k::kv_t6_encode(dk32, dv32, dk, dv, T, KV, kv_cap, pos0, nullptr, 0);
+        const auto gk = host(dk, (size_t) kv_cap * KV * 98), gv = host(dv, (size_t) kv_cap * KV * 98);
+        size_t bad = 0;
+        for (int t = 0; t < T; ++t)
+            for (int g = 0; g < KV; ++g)
+                for (int z = 0; z < 2; ++z) {
+                    uint8_t want[98];
+                    t6::QuantizeBlock((z ? v32 : k32).data() + ((size_t) t * KV + g) * 128, want);
+                    bad += std::memcmp((z ? gv : gk).data() + ((size_t) ((pos0 + t) % kv_cap) * KV + g) * 98, want, 98) != 0;
+                }
+        char nm[96];
+        std::snprintf(nm, sizeof nm, "turbo6 encode = QuantizeBlock byte for byte (%zu of %d blocks off)", bad, T * KV * 2);
+        expect_true(nm, bad == 0);
+        for (void* p : {(void*) dk32, (void*) dv32, (void*) dk, (void*) dv}) cudaFree(p);
+    }
+    const int ctx = 2000;
+    for (int ring = 0; ring < 2; ++ring) {   // 2. a cache of ctx positions (ring: the last 1100 in slots pos % 1100)
+        const int kv_cap = ring ? 1100 : 0, window = ring ? 1024 : (1 << 30), qpos = ctx - 1;
+        const int k0 = ring ? qpos - window + 1 : 0, nk = qpos + 1 - k0, first = ring ? ctx - kv_cap : 0;
+        const int slots = ring ? kv_cap : ctx;
+        std::vector<uint8_t> kb((size_t) slots * KV * 98), vb(kb.size());
+        std::vector<float> kf((size_t) ctx * KD, 0.0f), vf((size_t) ctx * KD, 0.0f), row(128);
+        for (int pos = first; pos < ctx; ++pos)
+            for (int g = 0; g < KV; ++g)
+                for (int z = 0; z < 2; ++z) {
+                    for (int i = 0; i < 128; ++i) row[i] = frand(z ? 1.5f : 3.0f) * (i % 37 == 5 ? 8.0f : 1.0f);
+                    uint8_t* b = (z ? vb : kb).data() + ((size_t) (ring ? pos % kv_cap : pos) * KV + g) * 98;
+                    t6::QuantizeBlock(row.data(), b);
+                    float* d = (z ? vf : kf).data() + (size_t) pos * KD + (size_t) g * 128;
+                    t6::DequantizeBlock(b, d), t6::RotateInverse(d);
+                }
+        uint8_t *dk = dev(kb), *dv = dev(vb);
+        if (!ring) {   // the unpack of positions 100 .. 1099
+            const int u0 = 100, un = 1000;
+            uint16_t *k16 = dev_n<uint16_t>((size_t) un * KD), *v16 = dev_n<uint16_t>((size_t) un * KD);
+            k::unpack_kv_t6_to_f16(dk, dv, 0, u0, un, KV, k16, v16, 0);
+            const auto hk = host(k16, (size_t) un * KD), hv = host(v16, (size_t) un * KD);
+            // equal bits, or both zero: the kernel writes +0 for a -0 product (its v_fma_mix adds +0), values IEEE-equal
+            auto same = [](uint16_t a, uint16_t b) { return a == b || ((a | b) & 0x7fff) == 0; };
+            size_t bad = 0;
+            for (size_t i = 0; i < (size_t) un * KD; ++i)
+                bad += !same(hk[i], f2h_host(kf[(size_t) u0 * KD + i])) || !same(hv[i], f2h_host(vf[(size_t) u0 * KD + i]));
+            expect_true("turbo6 unpack = the CPU decode rounded to FP16 (+0 = -0)", bad == 0);
+            cudaFree(k16), cudaFree(v16);
+        }
+        auto q = fvec((size_t) H * 128, 3.0f), r = fvec((size_t) H * d_rel, 2.0f), sink = fvec(H, 3.0f),
+             proj = fvec((size_t) extent * d_rel);
+        float *dq = dev(q), *dr = dev(r), *ds = dev(sink), *dp = dev(proj), *dkf = dev(kf), *dvf = dev(vf);
+        const int P = 8;
+        float *scr = dev_n<float>((size_t) H * P * 130), *out = dev_n<float>((size_t) H * 128);
+        float *scr2 = dev_n<float>((size_t) H * (ctx + 32 * 130)), *out2 = dev_n<float>((size_t) H * 128);
+        const float scale = 1.0f / std::sqrt(128.0f);
+        k::attn_decode_t6(dq, dr, ds, dk, dv, kv_cap, 1, H, KV, k0, nk, qpos, nullptr, P, scale, dp, d_rel, extent,
+                          window, scr, out, 0);
+        k::attn_decode(dq, dr, ds, dkf, dvf, H, KV, 128, k0, nk, qpos, scale, dp, d_rel, extent, window, scr2, out2, 0);
+        const auto want = host(out2, (size_t) H * 128);
+        expect(ring ? "turbo6 reader, sliding ring = attn_decode F32" : "turbo6 reader, full = attn_decode F32",
+               host(out, (size_t) H * 128), std::vector<double>(want.begin(), want.end()), 1e-3, 1e-4);
+        for (void* p : {(void*) dk, (void*) dv, (void*) dq, (void*) dr, (void*) ds, (void*) dp, (void*) dkf, (void*) dvf,
+                        (void*) scr, (void*) out, (void*) scr2, (void*) out2})
+            cudaFree(p);
+    }
+}
+
+// the token path's turbo6 reader (k::attn_tok_t6: one launch or three, set 7's combine or not) against
+// the calls it replaces (prep_qkv_r_t6 + attn_decode_t6 + gate_mul_f16): both caches, out, out16 and the sinks bit for
+// bit, over a cache of random encoded rows, positions inside and past a ring, with and without the log scale
+void test_turbo6_tok() {
+    namespace t6 = ik2::t6;
+    const int KV = 8, H = 24, KD = KV * 128, d_rel = 16, extent = 1024, C = 2304, ctx = 2000;
+    const float qk_clip = 22.627417f, rel_clip = 8.0f, eps = 1e-6f, alpha = 0.1f, n_floor = 512.0f;
+    const float qk_scale = 1.0f / std::sqrt(128.0f);
+    struct Case {
+        bool sliding;
+        int qpos;
+        bool one, skip;
+    };
+    const Case cases[] = {{true, 5, true, false},    {true, 700, true, false},  {true, 1500, true, false},
+                          {true, 1500, false, false}, {false, 5, false, false},  {false, 300, false, true},
+                          {false, 1999, false, true}, {false, 1999, false, false}};
+    for (const Case& cs : cases) {
+        const int kv_cap = cs.sliding ? 1100 : ctx, ring = cs.sliding ? kv_cap : 0;
+        const int window = cs.sliding ? 1024 : (1 << 30), P = cs.sliding ? 16 : 128;
+        std::vector<uint8_t> kb((size_t) kv_cap * KV * 98), vb(kb.size());
+        std::vector<float> row(128);
+        for (int s = 0; s < kv_cap; ++s)
+            for (int g = 0; g < KV; ++g)
+                for (int z = 0; z < 2; ++z) {
+                    for (int i = 0; i < 128; ++i) row[i] = frand(z ? 1.5f : 3.0f) * (i % 37 == 5 ? 8.0f : 1.0f);
+                    t6::QuantizeBlock(row.data(), (z ? vb : kb).data() + ((size_t) s * KV + g) * 98);
+                }
+        auto q = fvec((size_t) H * 128, 4.0f), kin = fvec(KD, 4.0f), vin = fvec(KD, 2.0f);
+        auto r = fvec((size_t) H * d_rel, 4.0f), proj = fvec((size_t) extent * d_rel), gate = fvec((size_t) H * 128, 3.0f);
+        auto sx = fvec(C, 1.0f);
+        std::vector<float> qc((size_t) H * 128), rc((size_t) H * d_rel);
+        for (auto& v : qc) v = 1.0f + frand(0.5f);
+        for (auto& v : rc) v = 1.0f + frand(0.5f);
+        std::vector<uint16_t> sw((size_t) H * C);
+        for (auto& v : sw) v = (uint16_t) ((rng() & 0x37FF) | ((rng() & 1) << 15));
+        const std::vector<int> pos{cs.qpos};
+        int* dpos = dev(pos);
+        float *dqc = dev(qc), *drc = dev(rc), *dproj = dev(proj), *dgate = dev(gate), *dsx = dev(sx);
+        uint16_t* dsw = dev(sw);
+        // the old calls
+        float *q1 = dev(q), *k1 = dev(kin), *v1 = dev(vin), *r1 = dev(r), *sink1 = dev_n<float>(H);
+        uint8_t *kc1 = dev(kb), *vc1 = dev(vb);
+        float *scr1 = dev_n<float>((size_t) H * P * 130), *out1 = dev_n<float>((size_t) H * 128);
+        uint16_t* o16_1 = dev_n<uint16_t>((size_t) H * 128);
+        k::prep_qkv_r_t6(q1, dqc, k1, v1, r1, drc, 1, H, KV, 128, d_rel, qk_clip, rel_clip, eps,
+                         cs.sliding ? nullptr : dpos, alpha, n_floor, k1, v1, kc1, vc1, kv_cap, 0, dpos, nullptr, dsw,
+                         dsx, C, sink1, 0);
+        k::attn_decode_t6(q1, r1, sink1, kc1, vc1, ring, 1, H, KV, 0, 0, 0, dpos, P, qk_scale, dproj, d_rel, extent,
+                          window, scr1, out1, 0);
+        k::gate_mul_f16(out1, dgate, (size_t) H * 128, o16_1, true, 0);
+        // the new reader
+        float *q2 = dev(q), *k2 = dev(kin), *v2 = dev(vin), *r2 = dev(r), *sink2 = dev_n<float>(H);
+        uint8_t *kc2 = dev(kb), *vc2 = dev(vb);
+        float *scr2 = dev_n<float>((size_t) H * P * 130), *out2 = dev_n<float>((size_t) H * 128);
+        uint16_t* o16_2 = dev_n<uint16_t>((size_t) H * 128);
+        const bool took = k::attn_tok_t6(q2, dqc, k2, v2, r2, drc, H, KV, 128, d_rel, qk_clip, rel_clip, eps, dpos,
+                                         !cs.sliding, alpha, n_floor, kc2, vc2, kv_cap, cs.sliding, dsw, dsx, C, sink2,
+                                         qk_scale, dproj, extent, window, P, cs.one, cs.skip, scr2, dgate, out2, o16_2,
+                                         0);
+        const size_t nb = kb.size(), no = (size_t) H * 128;
+        const auto a_k = host(kc1, nb), b_k = host(kc2, nb), a_v = host(vc1, nb), b_v = host(vc2, nb);
+        const auto a_o = host(out1, no), b_o = host(out2, no), a_s = host(sink1, H), b_s = host(sink2, H);
+        const auto a_h = host(o16_1, no), b_h = host(o16_2, no);
+        const bool same = took && a_k == b_k && a_v == b_v && !std::memcmp(a_o.data(), b_o.data(), no * 4) &&
+                          !std::memcmp(a_s.data(), b_s.data(), (size_t) H * 4) && a_h == b_h;
+        size_t off = 0;
+        for (size_t i = 0; i < no; ++i) off += std::memcmp(&a_o[i], &b_o[i], 4) != 0;
+        char nm[160];
+        std::snprintf(nm, sizeof nm,
+                      "turbo6 token reader = old (%s, pos %d, %s%s): caches, out, out16, sinks bit for bit (%zu outs off)",
+                      cs.sliding ? "window ring" : "full", cs.qpos, cs.one ? "one launch" : "three launches",
+                      cs.skip ? ", skip" : "", off);
+        expect_true(nm, same);
+        for (void* p : {(void*) dpos, (void*) dqc, (void*) drc, (void*) dproj, (void*) dgate, (void*) dsx, (void*) dsw,
+                        (void*) q1, (void*) k1, (void*) v1, (void*) r1, (void*) sink1, (void*) kc1, (void*) vc1,
+                        (void*) scr1, (void*) out1, (void*) o16_1, (void*) q2, (void*) k2, (void*) v2, (void*) r2,
+                        (void*) sink2, (void*) kc2, (void*) vc2, (void*) scr2, (void*) out2, (void*) o16_2})
+            cudaFree(p);
+    }
+}
+
+// hb_attn_prefill_t6 (IK2_HBPF bit 8) = hb_attn_prefill over an FP16 cache of the same slots holding
+// the CPU decode of the turbo6 blocks (= unpack's values, test_turbo6), bit for bit: a window over a ring (the scratch
+// rows wrapping), a full visit in one call, and the same full visit in passes (the softmax state carried; blocks whose
+// queries end before a pass, partial last blocks)
+void test_turbo6_pf() {
+    namespace t6 = ik2::t6;
+    const int KV = 8, H = 24, KD = KV * 128, d_rel = 16, extent = 1024;
+    const float qk_scale = 1.0f / std::sqrt(128.0f);
+    struct Case {
+        int T, pos0, slots, kv_cap, window, rows, pass, want_plan;
+        const char* name;
+    };
+    const Case cases[] = {{70, 1500, 1100, 1100, 1024, 1500, 1472, 1, "window ring, scratch rows wrap"},
+                          {300, 1000, 1400, 0, 1 << 30, 2048, 2048, 1, "full, one call"},
+                          {300, 1000, 1400, 0, 1 << 30, 2048, 256, 6, "full, 6 passes of 256"},
+                          {200, 0, 1400, 0, 1 << 30, 2048, 64, 4, "full from 0, 4 passes of 64"}};
+    for (const Case& cs : cases) {
+        std::vector<uint8_t> kb((size_t) cs.slots * KV * 98), vb(kb.size());
+        std::vector<uint16_t> k16((size_t) cs.slots * KD), v16(k16.size());
+        std::vector<float> row(128), d(128);
+        for (int s = 0; s < cs.slots; ++s)
+            for (int g = 0; g < KV; ++g)
+                for (int z = 0; z < 2; ++z) {
+                    for (int i = 0; i < 128; ++i) row[i] = frand(z ? 1.5f : 3.0f) * (i % 37 == 5 ? 8.0f : 1.0f);
+                    uint8_t* b = (z ? vb : kb).data() + ((size_t) s * KV + g) * 98;
+                    t6::QuantizeBlock(row.data(), b);
+                    t6::DequantizeBlock(b, d.data()), t6::RotateInverse(d.data());
+                    uint16_t* o = (z ? v16 : k16).data() + (size_t) s * KD + (size_t) g * 128;
+                    for (int i = 0; i < 128; ++i) o[i] = f2h_host(d[i]);
+                }
+        std::vector<uint16_t> q((size_t) cs.T * H * 128);
+        for (auto& v : q) v = f2h_host(frand(3.0f));
+        auto r = fvec((size_t) cs.T * H * d_rel, 2.0f), sink = fvec((size_t) cs.T * H, 3.0f),
+             rel = fvec((size_t) extent * d_rel);
+        const size_t no = (size_t) cs.T * H * 128, st_floats = (size_t) cs.T * H * 132;
+        uint16_t *dq = dev(q), *dk16 = dev(k16), *dv16 = dev(v16);
+        uint16_t *sk = dev_n<uint16_t>((size_t) cs.rows * KD), *sv = dev_n<uint16_t>((size_t) cs.rows * KD);
+        uint8_t *dkb = dev(kb), *dvb = dev(vb);
+        float *dr = dev(r), *ds = dev(sink), *drel = dev(rel);
+        float *want = dev_n<float>(no), *got = dev_n<float>(no), *st = dev_n<float>(st_floats);
+        k::hb_attn_prefill(dq, dr, ds, dk16, dv16, cs.slots, cs.T, cs.pos0, cs.window, extent, drel, qk_scale, want, 0);
+        const int plan = k::hb_attn_t6_plan(cs.T, cs.pos0, cs.window, cs.rows, cs.pass, st_floats);
+        if (plan == cs.want_plan)
+            k::hb_attn_prefill_t6(dq, dr, ds, dkb, dvb, cs.kv_cap, cs.T, cs.pos0, cs.window, extent, drel, qk_scale, got,
+                                  sk, sv, cs.rows, cs.pass, st, st_floats, 0);
+        const auto a = host(want, no), b = host(got, no);
+        size_t off = 0, bad = 0;
+        float big = 0.0f;
+        for (size_t i = 0; i < no; ++i) {
+            off += std::memcmp(&a[i], &b[i], 4) != 0;
+            bad += !std::isfinite(a[i]);
+            big = std::max(big, std::fabs(a[i]));
+        }
+        char nm[192];
+        std::snprintf(nm, sizeof nm,
+                      "turbo6 prefill attention = FP16 kernel on the decode (%s): plan %d (want %d), %zu of %zu outs off, "
+                      "%zu not finite, max |out| %.3g",
+                      cs.name, plan, cs.want_plan, off, no, bad, (double) big);
+        expect_true(nm, plan == cs.want_plan && off == 0 && bad == 0 && big > 0.0f);
+        for (void* p : {(void*) dq, (void*) dk16, (void*) dv16, (void*) sk, (void*) sv, (void*) dkb, (void*) dvb,
+                        (void*) dr, (void*) ds, (void*) drel, (void*) want, (void*) got, (void*) st})
+            cudaFree(p);
+    }
+    // the plan's refusals: a window's keys past the rows; passes not a multiple of 64; no room for the state
+    expect_true("turbo6 prefill plan refuses: window past the rows, pass 100, state room short",
+                k::hb_attn_t6_plan(2048, 4096, 1024, 3000, 2048, 1u << 30) == 0 &&
+                    k::hb_attn_t6_plan(300, 1000, 1 << 30, 2048, 100, 1u << 30) == 0 &&
+                    k::hb_attn_t6_plan(300, 1000, 1 << 30, 2048, 256, (size_t) 300 * 24 * 132 - 1) == 0);
+}
+#endif  // STRATA_USE_HIP
 int main() {
     int dev_count = 0;
     CU(cudaGetDeviceCount(&dev_count));
     cudaDeviceProp p{};
     CU(cudaGetDeviceProperties(&p, 0));
     std::printf("ik2_kernels_test on %s (sm_%d%d)\n", p.name, p.major, p.minor);
+#if defined(STRATA_USE_HIP)
+    if (getenv("IK2_TEST_T6") && std::atoi(getenv("IK2_TEST_T6"))) {   // (the turbo6 tests alone)
+        test_turbo6();
+        test_turbo6_tok();
+        test_turbo6_pf();
+        std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
+        return g_fail ? 1 : 0;
+    }
+#endif  // STRATA_USE_HIP
     test_rms();
     test_l2clip();
     test_conv();
@@ -2931,15 +3171,28 @@ int main() {
     test_round2_fused();
     test_fp8_kv();
     test_round6();
+#if defined(STRATA_USE_HIP)   // (the AMD build has no tensor-core paths: ik2_kernels.cu)
+    std::printf("test_attn_flash, test_attn_decode_mma: skipped (tensor-core paths, not in the AMD build)\n");
+#else
     test_attn_flash();   // (last: its random data leaves the others' as they were)
     test_attn_decode_mma();
+#endif  // STRATA_USE_HIP
     test_cand_topk();
     test_token_path();
     test_expert_limbs();
+#if defined(STRATA_USE_HIP)
+    std::printf("test_experts_mma, test_q8_verify_tile, test_attn_slots: skipped (tensor-core paths, not in the AMD "
+                "build)\n");
+    test_conv_slots();
+    test_turbo6();   // (IK2_KV=turbo6; last: the other tests' random data stay as they were)
+    test_turbo6_tok();
+    test_turbo6_pf();
+#else
     test_experts_mma();
     test_q8_verify_tile();
     test_conv_slots();
     test_attn_slots();
+#endif  // STRATA_USE_HIP
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
