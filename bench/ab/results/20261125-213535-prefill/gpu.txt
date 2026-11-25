@@ -1,0 +1,12 @@
+base r1: 2010 MHz, 9751 MHz, 5 %, 157.38 W, 52, 1252 MiB
+c4k r1: 1980 MHz, 9751 MHz, 1 %, 171.50 W, 60, 737 MiB
+nodec r1: 1965 MHz, 9751 MHz, 0 %, 227.16 W, 61, 673 MiB
+nodec4k r1: 1965 MHz, 9751 MHz, 11 %, 223.43 W, 61, 673 MiB
+base r2: 1965 MHz, 9751 MHz, 5 %, 222.74 W, 61, 673 MiB
+c4k r2: 1965 MHz, 9751 MHz, 5 %, 238.15 W, 62, 673 MiB
+nodec r2: 1965 MHz, 9751 MHz, 4 %, 228.29 W, 62, 673 MiB
+nodec4k r2: 1965 MHz, 9501 MHz, 6 %, 231.92 W, 62, 673 MiB
+base r3: 1965 MHz, 9751 MHz, 4 %, 215.79 W, 62, 673 MiB
+c4k r3: 1965 MHz, 9751 MHz, 3 %, 221.98 W, 63, 672 MiB
+nodec r3: 1965 MHz, 9751 MHz, 2 %, 238.43 W, 63, 672 MiB
+nodec4k r3: 1965 MHz, 9751 MHz, 6 %, 235.15 W, 63, 672 MiB

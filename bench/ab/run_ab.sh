@@ -2,7 +2,7 @@
 # A/B de variables de entorno de maya-ik2 sobre la línea base (bench/baseline): las configuraciones se alternan en cada
 # repetición (A B C A B C ...) para que la deriva térmica no favorezca a ninguna. Arranque en frío cada corrida.
 # Uso (raíz del repo, GPU libre):
-#   SCEN=decode|prefill REPS=3 bench/ab/run_ab.sh base= split66='IK2_EXPERT_MMA_SPLIT=6 IK2_EXPERT_MMA_SPLIT_DOWN=6' ...
+#   SCEN=decode|prefill REPS=3 [BIN=build/maya-ik2] bench/ab/run_ab.sh base= c4k=CHUNK=4096 split66='IK2_EXPERT_MMA_SPLIT=6 IK2_EXPERT_MMA_SPLIT_DOWN=6' ...
 #   decode:  prompt de 4096 tokens + 400 generados (mide la decodificación)
 #   prefill: prompt de 16384 tokens + 8 generados (mide el prellenado)
 # → bench/ab/results/<fecha>-<SCEN>/ con un log por corrida, gpu.txt y summary.md (mediana y rango por configuración).
@@ -20,14 +20,16 @@ OUT=bench/ab/results/$(date +%Y%m%d-%H%M%S)-$SCEN
 mkdir -p "$OUT"
 export IK2_KV=${IK2_KV:-fp8} IK2_GATE_TILE=64 IK2_GATE_BF16=1 IK2_Q8_UNROLL=1 IK2_BATCH_PREFILL=1
 { echo "commit: $(git rev-parse HEAD 2>/dev/null)"; nvidia-smi --query-gpu=name,driver_version,memory.used,clocks.max.sm --format=csv,noheader
-  sha256sum build/maya-ik2; echo "SCEN=$SCEN REPS=$REPS CTX=$CTX"; env | grep -E "^IK2_" | sort; printf '%s\n' "$@"; } > "$OUT/env.txt"
+  sha256sum ${BIN:-build/maya-ik2}; echo "SCEN=$SCEN REPS=$REPS CTX=$CTX"; env | grep -E "^IK2_" | sort; printf '%s\n' "$@"; } > "$OUT/env.txt"
 for r in $(seq 1 "$REPS"); do
   for cfg in "$@"; do
     name=${cfg%%=*}; vars=${cfg#*=}
     log=$OUT/$name.r$r.log
     # el estado de la GPU antes de cada corrida (comparte el escritorio): un tramo lento se ve aquí
     echo "$name r$r: $(nvidia-smi --query-gpu=clocks.sm,clocks.mem,utilization.gpu,power.draw,temperature.gpu,memory.used --format=csv,noheader)" >> "$OUT/gpu.txt"
-    env $vars build/maya-ik2 --model $M --ctx "$CTX" --chunk 2048 "${args[@]}" > "$log" 2>&1
+    # CHUNK=N en la configuración: --chunk N (2048 si no)
+    ck=$(grep -oE '(^| )CHUNK=[0-9]+' <<< "$vars" | grep -oE '[0-9]+$' || true)
+    env $vars ${BIN:-build/maya-ik2} --model $M --ctx "$CTX" --chunk "${ck:-2048}" "${args[@]}" > "$log" 2>&1
     rc=$?
     grep -q "tokens take the resident path" "$log" || echo "!! $name r$r: no quedó residente" | tee -a "$log"
     echo "$name r$r exit=$rc $(grep -E '^(prompt|generation):' "$log" | grep -oE '\([0-9.]+ tok/s\)' | tr '\n' ' ')"

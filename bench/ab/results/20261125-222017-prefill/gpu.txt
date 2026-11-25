@@ -1,0 +1,12 @@
+c4k r1: 315 MHz, 405 MHz, 24 %, 47.56 W, 50, 773 MiB
+pf4k r1: 1965 MHz, 9751 MHz, 6 %, 229.78 W, 63, 801 MiB
+base r1: 1965 MHz, 9751 MHz, 4 %, 228.71 W, 64, 741 MiB
+pf r1: 1965 MHz, 9751 MHz, 8 %, 228.82 W, 65, 760 MiB
+c4k r2: 1965 MHz, 9751 MHz, 4 %, 217.27 W, 65, 782 MiB
+pf4k r2: 1965 MHz, 9751 MHz, 12 %, 221.52 W, 66, 730 MiB
+base r2: 1965 MHz, 9751 MHz, 9 %, 228.75 W, 66, 931 MiB
+pf r2: 1950 MHz, 9751 MHz, 5 %, 233.67 W, 67, 778 MiB
+c4k r3: 1965 MHz, 9751 MHz, 5 %, 232.25 W, 67, 826 MiB
+pf4k r3: 1965 MHz, 9751 MHz, 6 %, 219.02 W, 67, 767 MiB
+base r3: 1965 MHz, 9751 MHz, 6 %, 220.88 W, 67, 784 MiB
+pf r3: 1950 MHz, 9751 MHz, 5 %, 216.90 W, 67, 772 MiB
