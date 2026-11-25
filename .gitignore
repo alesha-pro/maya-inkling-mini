@@ -27,6 +27,7 @@ td.log
 /.venv/
 /build/
 /third_party/llama.cpp/
+/third_party/llama.cpp-b*/
 /models/
 /packs/
 /mtp/
@@ -38,6 +39,8 @@ td.log
 /maya-*.json.prev
 /.maya-switch.json
 /token-savings.json*
+token-savings.json*
+/ik2/
 /vision-memory.json
 /answers/
 /run-maya-*.sh

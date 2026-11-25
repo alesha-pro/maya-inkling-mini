@@ -306,7 +306,9 @@ tokenizer folder and a run config by hand, then `serve/server.py` ([INKLING2.md]
 | [unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Inkling-2-Small-GGUF) (NVFP4 experts, layers 0-39) | 330 GiB; the experts ~323 GiB of pinned RAM | NVIDIA, Ampere on (CUDA), Linux; one or two GPUs. Run on H200 (35 tok/s) and RTX PRO 6000 (22; two: 42) |
 | unsloth's UD-Q3_K_XL (IQ3_XXS / IQ4_XS experts) | 266 GiB; ~260 GiB of pinned RAM | the same; H200: 44.6 tok/s |
 
-Text only, one request at a time. Its engine settings: [SETTINGS.md](SETTINGS.md#inkling-2-small).
+Text only; one request at a time by default, `--parallel N` for several. Its engine settings: [SETTINGS.md](SETTINGS.md#inkling-2-small).
+
+**[Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** (26 B MoE) runs on the same engine on one 24 GB card with every expert in VRAM, or an 8 GB card with a cache of them, with pictures and the official drafter: [INKLING2-MINI.md](INKLING2-MINI.md).
 
 ## Community quants of GLM-5.3-Flash
 

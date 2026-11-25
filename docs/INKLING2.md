@@ -236,7 +236,7 @@ half the experts', half the dense) and its launches - each 2 us and more whateve
 
 - the short convs ride the products before them (`mv_q8p_conv`), the MoE's conv the experts' combine, the sinks
   the clips' launch; a looped layer's q, k and v products are one launch (`MvAlt`), its three norms one, its four
-  messages one; the router's picks and their tables one (`route_token`): 1404 -> 781 launches a token;
+  messages one; the router's picks and their tables one (`route_token`): 1404 -> 757 launches a token;
 - the attention of a token runs on the tensor cores, a warp at a time straight from the cache into the registers
   (`attn_decode_mma`: no shared memory, so sixteen and more warps an SM hide the memory's latency). It reads the
   cache at the memory's speed - 846 GB/s FP16, 776 GB/s FP8 on an RTX 3090 - and an FP8 cache, half the bytes, is

@@ -161,7 +161,7 @@ Decode slows down with depth for a physical reason. 8 of the 48 layer visits att
 
 ## An 8 GB card
 
-[`ik2-mini-8gb.json`](inkling2-mini/ik2-mini-8gb.json) runs the same file on a card that holds a quarter of the experts. The experts stay in pinned host memory (14.7 GiB of RAM), the GPU keeps a 3.8 GiB cache of them, and the CPU computes each missing expert from host memory while the GPU runs the cached ones. Measured on a laptop with an RTX 5070 Laptop GPU (8 GB, PCIe 4.0 x8), a Ryzen 9 270 (AVX-512) and DDR5 that reads at 58 GB/s: 40 to 43 tok/s through the server on five chat prompts of 500 to 600 tokens, at a 16,384 token context. llama.cpp with its experts on the CPU gets 12.5 tok/s on the same laptop.
+[`ik2-mini-8gb.json`](inkling2-mini/ik2-mini-8gb.json) runs the same file on a card that holds a quarter of the experts. The experts stay in pinned host memory (14.7 GiB of RAM), the GPU keeps a 3.8 GiB cache of them, and the CPU computes each missing expert from host memory while the GPU runs the cached ones. Measured on a laptop with an RTX 5070 Laptop GPU (8 GB, PCIe 4.0 x8), a Ryzen 9 270 (AVX-512) and DDR5 that reads at 58 GB/s: 40 to 43 tok/s through the server on five chat prompts of 500 to 600 tokens, one at a time (the config has no `--parallel`), at a 16,384 token context. llama.cpp with its experts on the CPU gets 12.5 tok/s on the same laptop.
 
 | Setting | What it does |
 |---|---|
@@ -178,7 +178,7 @@ The limits on that laptop: the CPU computes a miss at 37 to 41 GB/s of the 58 GB
 
 Inkling 2 Mini is a 26B MoE: 24 layers of weights, 128 experts each (8 per token), and layers 6 to 17 run 3 times, which makes 48 layer visits per token. 40 visits use a sliding window of 1,024 keys, 8 see everything.
 
-**Everything in VRAM.** The experts are 14.7 GiB and the dense weights 1.1 GiB as the GGUF's Q8_0 blocks. On a 24 GB card that leaves room for the KV cache, so a token needs nothing from the host between its embedding and its logits. The router's picks are resolved on the device through a table of pointers, and the 781 kernel launches of a token replay as one CUDA graph.
+**Everything in VRAM.** The experts are 14.7 GiB and the dense weights 1.1 GiB as the GGUF's Q8_0 blocks. On a 24 GB card that leaves room for the KV cache, so a token needs nothing from the host between its embedding and its logits. The router's picks are resolved on the device through a table of pointers, and the 757 kernel launches of a token replay as one CUDA graph.
 
 **NVFP4 without FP4 hardware.** The experts of layers 0 to 19 are 4-bit codes with one scale per 16 values. The kernel loads the codes straight from VRAM, turns them into FP16 in registers (a code times its scale is exact in FP16) and hands them to the tensor cores, which sum in FP32. No decoded copy is ever stored. The input goes in as 2 FP16 parts in 2 of the 8 tensor core columns, which costs nothing and gives back the precision of an FP32 input.
 
@@ -186,7 +186,7 @@ Inkling 2 Mini is a 26B MoE: 24 layers of weights, 128 experts each (8 per token
 
 **Attention at memory speed.** A token's attention runs on the tensor cores, a warp at a time straight from the cache into registers: 846 GB/s over an FP16 cache, 776 GB/s over FP8.
 
-**Fewer launches.** Every kernel launch costs 2 µs or more whatever it does. Convs ride the products before them, a looped layer's q, k and v products are one launch, the loop's messages for all 12 core layers are one launch per pass: 1,404 launches per token became 781.
+**Fewer launches.** Every kernel launch costs 2 µs or more whatever it does. Convs ride the products before them, a looped layer's q, k and v products are one launch, the loop's messages for all 12 core layers are one launch per pass: 1,404 launches per token became 757.
 
 **The drafter's window.** Thinking Machines' drafter (3 layers, fed by the model's stream at visits 5, 23 and 41 and its final hidden) guesses the next tokens, and the model checks the anchor and the guesses in one pass. That pass has its own path: positions read from the device, the window's expert picks grouped on the GPU so an expert is read once for all the tokens that picked it (5 tokens read 2.7 times one token's experts, not 5), the attention reading each key once for the window's queries, the short convs' histories recorded and rolled back in one launch for the rejected tokens, one CUDA graph per window size. 5 tokens cost 15.6 ms against 7.8 ms for one, and 40.8 ms through the general prompt path. Sampled output stays exact: a guess is accepted with the model's probability of it, otherwise the model's distribution without it is sampled.
 

@@ -2672,7 +2672,8 @@ thinkingmachines' [Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkl
 its own engine, `maya-ik2` (`src/ik2`; CUDA on Linux, Ampere on), from unsloth's GGUFs
 ([unsloth/Inkling-2-Small-GGUF](https://huggingface.co/unsloth/Inkling-2-Small-GGUF): UD-Q4_K_XL, UD-Q3_K_XL) read in
 place. The routed experts sit in pinned host memory (~323 GiB for UD-Q4_K_XL, ~260 GiB for UD-Q3_K_XL) with a cache of
-them in VRAM; one request at a time, text only. `maya.py` does not set it up yet: docs/INKLING2.md section 6 has the
+them in VRAM; text only, one request at a time by default (`--parallel N`, up to 8 on one GPU, serves several:
+[INKLING2-MINI.md](INKLING2-MINI.md), which is the same engine on Inkling-2-Mini). `maya.py` does not set it up yet: docs/INKLING2.md section 6 has the
 tokenizer folder and the run config, then `python serve/server.py --engine maya --config ik2.json`.
 
 **Defaults**: temperature 1.0, top-p 1.0 (its card and files name none); the thinking level Auto, the template's own
