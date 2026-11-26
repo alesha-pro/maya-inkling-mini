@@ -89,16 +89,24 @@ void attn_probs_f16(const float* lg, uint16_t* out16, int H, int Tq, int nk, int
 /// kc / vc the cache [pos or pos % kv_cap][KV * D]; keys [max(0, qp - window + 1), qp] of each query; the relative
 /// bias from the table bias [Tq * H][extent] (as attn_probs_bias_f16), sink [Tq][H] -> out [Tq] rows of o_ld (F32).
 /// The keys split n_split ways (scratch: n_split * Tq * H * (D + 2) floats; fewer splits if it holds fewer).
+/// rq given (not on the Hopper kernel): no table - the bias made in the kernel from the queries' 16 relative states
+/// rq [Tq][H][16] and relp, rel_proj [extent][16] (on the tensor cores, split FP16: the F32 product to ~2^-22).
 void attn_flash_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uint16_t* vc, int kv_cap, int H, int KV,
                     int D, int Tq, int qpos0, float qk_scale, const float* bias, int extent, int window,
                     const float* sink, float* out, int o_ld, float* scratch, size_t scratch_floats, int n_split,
-                    cudaStream_t s, const int* page_table = nullptr);
+                    cudaStream_t s, const int* page_table = nullptr, const float* rq = nullptr,
+                    const float* relp = nullptr);
 /// attn_flash_f16 over an FP8 (E4M3) cache: its tiles turned into FP16 as they are loaded; qk_scale with K's scale
 /// folded in, the output times v_inv_scale (as attn_decode_fp8).
 void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint8_t* vc, int kv_cap, int H, int KV,
                     int D, int Tq, int qpos0, float qk_scale, float v_inv_scale, const float* bias, int extent,
                     int window, const float* sink, float* out, int o_ld, float* scratch, size_t scratch_floats,
-                    int n_split, cudaStream_t s, const int* page_table = nullptr);
+                    int n_split, cudaStream_t s, const int* page_table = nullptr, const float* rq = nullptr,
+                    const float* relp = nullptr);
+/// the Hopper kernel (wgmma) is the one attn_flash_f16 runs here (it does not make the bias itself)
+bool fa_wgmma();
+/// the mma.sync flash kernel's softmax with ex2.approx and the scale in its FMA (IK2_FA_FAST=1 sets it at the start)
+void attn_flash_fast(int on);
 /// a split count for attn_flash_f16: Tq queries x H heads against up to nk keys on n_sm SMs
 int attn_flash_splits(int Tq, int H, int nk, int n_sm);
 
@@ -420,6 +428,20 @@ size_t block_bytes(int type);
 /// n values (a multiple of the block's) of `type` blocks -> FP16 (nearest; NVFP4: exact) or F32.
 void decode_f16(int type, const uint8_t* blocks, size_t n, uint16_t* out, cudaStream_t s);
 void decode_f32(int type, const uint8_t* blocks, size_t n, float* out, cudaStream_t s);
+/// The prompt's NVFP4 experts as one grouped GEMM (tensor cores, the weights decoded in shared memory, F32 sums): for
+/// every tile, Y [row0 + r][N] = X [row0 + r][K] . W [N][K]^T over its rows r < rows (at most bm: 64 or 128), W = w[which] as
+/// NVFP4 rows of K values.  K a multiple of 64 and N of 128 (experts_pf_nvfp4_fits).  tiles on the device.
+struct PfTile {
+    const uint8_t* w[2];
+    int row0, rows;
+};
+bool experts_pf_nvfp4_fits(int K, int N);
+/// The rows a tile may hold for the kernel experts_pf_nvfp4 runs (64 or 128), and that kernel (IK2_PF_KERNEL: 21 the
+/// default - raw weights decoded in registers, 128 x 128, 2 stages; 1 the first version; tests and benches set it).
+int experts_pf_nvfp4_bm();
+void experts_pf_nvfp4_variant(int v);
+void experts_pf_nvfp4(const PfTile* tiles, int n_tiles, int bm, int which, const uint16_t* X, int K, int N, float* Y,
+                      cudaStream_t s);
 /// ... on the host (the reference of the tests, and the embedding's rows).
 void decode_host(int type, const uint8_t* blocks, size_t n, float* out);
 

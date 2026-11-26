@@ -1477,7 +1477,20 @@ void test_attn_decode_mma() {
 
 // attn_flash_f16 (the fused prefill attention) against a double reference: linear and ring caches, a window, the
 // relative bias table, the sink, a chunk from 0 and one at an offset, 1 to 7 key splits (some of them empty).
+void test_attn_flash_run(bool fast);
 void test_attn_flash() {
+    // the default kernel; then IK2_FA_FAST's on the same data (the random generator put back: the tests after
+    // these see the data they always did)
+    const std::mt19937 at = rng;
+    test_attn_flash_run(false);
+    const std::mt19937 after = rng;
+    rng = at;
+    k::attn_flash_fast(1);
+    test_attn_flash_run(true);
+    k::attn_flash_fast(0);
+    rng = after;
+}
+void test_attn_flash_run(bool fast) {
     const int H = 12, KV = 2, D = 128;
     struct Case {
         int Tq, qpos0, window, extent, kv_cap, n_split;
@@ -1506,7 +1519,17 @@ void test_attn_flash() {
         auto qf = fvec((size_t) c.Tq * q_ld, 4.0f);
         std::vector<uint16_t> q16(qf.size());
         for (size_t i = 0; i < qf.size(); ++i) q16[i] = f2h_host(qf[i]);
-        auto bias = fvec((size_t) c.Tq * H * c.extent, 2.0f), sink = fvec((size_t) c.Tq * H, 3.0f);
+        // the bias as the model makes it: a query's 16 relative states . rel_proj [extent][16] (the table in F32 as
+        // cuBLAS writes it; the fused kernel takes rq and rel_proj and must give the same attention)
+        auto rq = fvec((size_t) c.Tq * H * 16, 1.5f), proj = fvec((size_t) c.extent * 16, 0.5f);
+        std::vector<float> bias((size_t) c.Tq * H * c.extent);
+        for (size_t qh = 0; qh < (size_t) c.Tq * H; ++qh)
+            for (int d = 0; d < c.extent; ++d) {
+                double a = 0;
+                for (int j = 0; j < 16; ++j) a += (double) rq[qh * 16 + j] * proj[(size_t) d * 16 + j];
+                bias[qh * c.extent + d] = (float) a;
+            }
+        auto sink = fvec((size_t) c.Tq * H, 3.0f);
         const float scale = 1.0f / std::sqrt((float) D);
         const int o_ld = H * D + 32;
         uint16_t *dq = dev(q16), *dk = dev(kc), *dv = dev(vc);
@@ -1516,6 +1539,11 @@ void test_attn_flash() {
         k::attn_flash_f16(dq, q_ld, dk, dv, c.kv_cap, H, KV, D, c.Tq, c.qpos0, scale, db, c.extent, c.window, ds, dout,
                           o_ld, dscr, scr, c.n_split, 0);
         const auto out = host(dout, (size_t) c.Tq * o_ld);
+        float *drq = dev(rq), *dpj = dev(proj), *dout2 = dev_n<float>((size_t) c.Tq * o_ld);
+        k::attn_flash_f16(dq, q_ld, dk, dv, c.kv_cap, H, KV, D, c.Tq, c.qpos0, scale, nullptr, c.extent, c.window, ds,
+                          dout2, o_ld, dscr, scr, c.n_split, 0, nullptr, drq, dpj);
+        const auto out2 = host(dout2, (size_t) c.Tq * o_ld);
+        std::vector<float> got2;
         std::vector<float> got;
         std::vector<double> want;
         for (int i = 0; i < c.Tq; ++i) {
@@ -1542,12 +1570,22 @@ void test_attn_flash() {
                         o += std::exp(l[kp - lo] - m) / sum * h2f_host(vc[((size_t) (c.kv_cap > 0 ? kp % c.kv_cap : kp) * KV + g) * D + d]);
                     want.push_back(o);
                     got.push_back(out[(size_t) i * o_ld + h * D + d]);
+                    got2.push_back(out2[(size_t) i * o_ld + h * D + d]);
                 }
             }
         }
-        expect(c.name, got, want, 1e-2, 2e-3);
+        char nm[96];
+        std::snprintf(nm, sizeof nm, "%s%s", fast ? "fast " : "", c.name);
+        expect(nm, got, want, 1e-2, 2e-3);
+        std::snprintf(nm, sizeof nm, "%s%s, bias made in the kernel", fast ? "fast " : "", c.name);
+        expect(nm, got2, want, 1e-2, 2e-3);
+        // and against the table's run: the bias the same to F32 rounding - which can still round P (FP16 for P V)
+        // the other way, so the outputs agree to FP16's precision, not F32's
+        std::vector<double> got_d(got.begin(), got.end());
+        std::snprintf(nm, sizeof nm, "%s%s, made = table", fast ? "fast " : "", c.name);
+        expect(nm, got2, got_d, 2e-3, 2e-5);
         for (uint16_t* p : {dq, dk, dv}) cudaFree(p);
-        for (float* p : {db, ds, dout, dscr}) cudaFree(p);
+        for (float* p : {db, ds, dout, dscr, drq, dpj, dout2}) cudaFree(p);
     }
 }
 
@@ -2906,6 +2944,91 @@ void test_attn_slots() {
         cudaFree(dsw);
 }
 
+// The prompt's grouped NVFP4 GEMM (k::experts_pf_nvfp4) at the model's shapes - gate | up (K = C = 2304, N = 2 F =
+// 2304) and down (K = F = 1152, N = C = 2304) - over experts of 1, 7, 64, 65 and 130 rows (whole and partial tiles of
+// 64 and of 128 rows),
+// against the weights' FP16 decode (k::decode_f16) and a double GEMM; rows outside the tiles keep what they held.
+void test_experts_pf_nvfp4() {
+    const int C = 2304, F = 1152;
+    const int cnts[] = {1, 7, 64, 65, 130};
+    const int E = 5;
+    for (int which = 0; which < 2; ++which) {
+        const int K = which == 0 ? C : F, N = which == 0 ? 2 * F : C;
+        if (!k::experts_pf_nvfp4_fits(K, N)) {
+            expect_true("experts_pf_nvfp4 fits the model's shapes", false);
+            return;
+        }
+        const size_t wbytes = (size_t) N * K / 64 * 36;
+        std::vector<std::vector<uint8_t>> wh(E, std::vector<uint8_t>(wbytes));
+        for (auto& w : wh)
+            for (size_t b = 0; b < wbytes; b += 36) {
+                for (int i = 0; i < 4; ++i) w[b + i] = (uint8_t) (((5 + rng() % 4) << 3) | (rng() & 7));   // (scales)
+                for (int i = 4; i < 36; ++i) w[b + i] = (uint8_t) rng();
+            }
+        int S = 1;   // (row 0: a gap no tile covers)
+        std::vector<int> start(E);
+        for (int e = 0; e < E; ++e) start[e] = S, S += cnts[e];
+        std::vector<uint16_t> xh((size_t) S * K);
+        for (auto& v : xh) v = f2h_host(frand(1.0f));
+        uint16_t* x_d = dev(xh);
+        std::vector<uint8_t*> w_d(E);
+        std::vector<k::PfTile> th;
+        for (int e = 0; e < E; ++e) {
+            w_d[e] = dev(wh[e]);
+            for (int m = 0; m < cnts[e]; m += 64)
+                th.push_back({{which == 0 ? w_d[e] : nullptr, which == 1 ? w_d[e] : nullptr}, start[e] + m,
+                              std::min(64, cnts[e] - m)});
+        }
+        k::PfTile* t_d = dev(th);
+        std::vector<float> y0((size_t) S * N, 7777.0f);
+        float* y_d = dev(y0);
+        k::experts_pf_nvfp4(t_d, (int) th.size(), 64, which, x_d, K, N, y_d, 0);
+        const std::vector<float> got = host(y_d, (size_t) S * N);
+        // the 128-row tiles: the same experts, the same output
+        std::vector<k::PfTile> th128;
+        for (int e = 0; e < E; ++e)
+            for (int m = 0; m < cnts[e]; m += 128)
+                th128.push_back({{which == 0 ? w_d[e] : nullptr, which == 1 ? w_d[e] : nullptr}, start[e] + m,
+                                 std::min(128, cnts[e] - m)});
+        k::PfTile* t128_d = dev(th128);
+        float* y128_d = dev(y0);
+        k::experts_pf_nvfp4(t128_d, (int) th128.size(), 128, which, x_d, K, N, y128_d, 0);
+        const std::vector<float> got128 = host(y128_d, (size_t) S * N);
+        CU(cudaFree(t128_d));
+        CU(cudaFree(y128_d));
+        std::vector<double> want((size_t) S * N, 7777.0);
+        uint16_t* w16_d = dev_n<uint16_t>((size_t) N * K);
+        double rms = 0;
+        for (int e = 0; e < E; ++e) {
+            k::decode_f16(k::kNVFP4, w_d[e], (size_t) N * K, w16_d, 0);
+            const std::vector<uint16_t> w16 = host(w16_d, (size_t) N * K);
+            std::vector<double> wf((size_t) N * K);
+            for (size_t i = 0; i < wf.size(); ++i) wf[i] = h2f_host(w16[i]);
+            for (int r = start[e]; r < start[e] + cnts[e]; ++r) {
+                std::vector<double> xr(K);
+                for (int kk = 0; kk < K; ++kk) xr[kk] = h2f_host(xh[(size_t) r * K + kk]);
+                for (int n = 0; n < N; ++n) {
+                    double acc = 0;
+                    const double* wr = wf.data() + (size_t) n * K;
+                    for (int kk = 0; kk < K; ++kk) acc += xr[kk] * wr[kk];
+                    want[(size_t) r * N + n] = acc;
+                    rms += acc * acc;
+                }
+            }
+        }
+        rms = std::sqrt(rms / ((double) (S - 1) * N));
+        expect(which == 0 ? "experts_pf_nvfp4 gate|up 2304x2304" : "experts_pf_nvfp4 down 2304x1152", got, want, 1e-4,
+               1e-4 * rms);
+        expect(which == 0 ? "experts_pf_nvfp4 128 gate|up" : "experts_pf_nvfp4 128 down", got128, want, 1e-4,
+               1e-4 * rms);
+        CU(cudaFree(x_d));
+        CU(cudaFree(t_d));
+        CU(cudaFree(y_d));
+        CU(cudaFree(w16_d));
+        for (auto p : w_d) CU(cudaFree(p));
+    }
+}
+
 int main() {
     int dev_count = 0;
     CU(cudaGetDeviceCount(&dev_count));
@@ -2940,6 +3063,7 @@ int main() {
     test_q8_verify_tile();
     test_conv_slots();
     test_attn_slots();
+    test_experts_pf_nvfp4();
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
