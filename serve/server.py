@@ -523,6 +523,27 @@ def error_body(e: Exception, kind: str = "invalid_request_error") -> dict:
     return {"error": err}
 
 
+# Anthropic's error type for a status with none of its own (its API's table: docs.anthropic.com, "Errors")
+ANTHROPIC_ERROR_TYPES = {400: "invalid_request_error", 401: "authentication_error", 403: "permission_error",
+                         404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error",
+                         529: "overloaded_error"}
+
+
+def anthropic_error(code: int, body: dict) -> dict:
+    """An error body in Anthropic's shape, {"type": "error", "error": {"type": ..., "message": ...}}, from the OpenAI
+    shape the handlers write: /v1/messages answers every error the way its SDKs and clients read them.
+    OpenAI's "server_error" is Anthropic's "api_error"; an error without a type takes its status's; extra fields (an
+    error's code, an engine error's partial_text) stay.  A body already in that shape is returned as it is."""
+    if body.get("type") == "error":
+        return body
+    err = body.get("error")
+    err = dict(err) if isinstance(err, dict) else {"message": str(err)}
+    kind = err.get("type")
+    err["type"] = "api_error" if kind == "server_error" else kind or ANTHROPIC_ERROR_TYPES.get(code, "api_error")
+    err.setdefault("message", "")
+    return {"type": "error", "error": err}
+
+
 # the engine's ERR when a route met a NaN or an infinity (Glm5Model::route_ok): it has dropped that conversation's state
 NONFINITE = "non-finite"
 
@@ -3944,7 +3965,8 @@ class Service:
     def chat_prompt(self, req: dict):
         """A chat request's template messages, tools and kwargs as prepare() gets them (the run config's thinking
         level included), for measuring its prompt without running it."""
-        messages, tools, kw = openai_to_messages(req, deepseek=getattr(self.template, "deepseek", False), glm_dsa=getattr(self.template, "glm_dsa", False))
+        messages, tools, kw = openai_to_messages(req, deepseek=getattr(self.template, "deepseek", False), glm_dsa=getattr(self.template, "glm_dsa", False),
+                                              tool_ids=getattr(self.template, "inkling", False))
         kw = {k: v for k, v in kw.items() if k != "_force_tool"}
         if req.get("strata_mcp") is True and self.mcp is not None:
             own = {t.get("name") for t in tools or []}
@@ -5656,6 +5678,19 @@ def request_timeout() -> float:
     return s if s > 0 else 300.0
 
 
+def stream_write_timeout() -> float:
+    """Seconds one write of a live stream may wait for its client: 30 by default, MAYA_STREAM_WRITE_TIMEOUT_S changes
+    it (never above request_timeout()).  A streamed answer holds the queue's turn while it writes; a client that
+    stopped reading with its connection still open (a suspended laptop, a stopped process) fills the socket's buffer,
+    and then each write would wait the full request timeout (300 s) before the turn went to the next request.  A
+    reader that keeps up never waits this long: its window empties as fast as tokens come."""
+    try:
+        s = float(os.environ.get("MAYA_STREAM_WRITE_TIMEOUT_S", "0"))
+    except ValueError:
+        s = 0.0
+    return min(s if s > 0 else 30.0, request_timeout())
+
+
 def body_limit() -> int:
     """The most a request body may hold, in bytes (it is read into memory): 256 MiB, a million-token conversation with
     room to spare; MAYA_MAX_BODY_MIB changes it.  A larger one is answered 413 before it is read (Strata #893)."""
@@ -5748,7 +5783,13 @@ def make_handler(svc: Service):
                                    "(MAYA_MAX_BODY_MIB raises the limit)")
             return self.rfile.read(length)
 
+        def _anthropic_path(self) -> bool:
+            """/v1/messages (and below it, with or without a query): its errors are Anthropic's shape."""
+            return self.path.split("?")[0].rstrip("/").startswith("/v1/messages")
+
         def _json(self, code, obj):
+            if code >= 400 and isinstance(obj, dict) and "error" in obj and self._anthropic_path():
+                obj = anthropic_error(code, obj)
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
@@ -5996,7 +6037,8 @@ def make_handler(svc: Service):
             oreq = svc.with_shared(oreq, "openai")
             oreq["_api"] = "openai"
             svc.check_request(oreq)
-            messages, tools, kw = openai_to_messages(oreq, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False))
+            messages, tools, kw = openai_to_messages(oreq, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False),
+                                              tool_ids=getattr(svc.template, "inkling", False))
             max_new = int(oreq.get("max_tokens") or 0)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(oreq))
             if kw.get("_prefill"):
@@ -6566,7 +6608,8 @@ def make_handler(svc: Service):
                     # a context change is reloading the model, or Maya is updating: say so, and when to try again
                     why = ("Project Maya is updating and starts again in a few minutes" if svc.updater.busy() else
                            "the model is reloading with a new context size; try again in a minute")
-                    body = json.dumps({"error": {"type": "overloaded_error", "message": why}}).encode()
+                    obj = {"error": {"type": "overloaded_error", "message": why}}
+                    body = json.dumps(anthropic_error(503, obj) if path == "/v1/messages" else obj).encode()
                     self.send_response(503)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Retry-After", "30")
@@ -6782,6 +6825,10 @@ def make_handler(svc: Service):
                 self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except OSError:
                 pass
+            # a live stream's writes wait for a stuck client stream_write_timeout() at most (it holds the turn); a
+            # background stream's own, shorter, limit stays
+            now = self.connection.gettimeout()
+            self.connection.settimeout(min(now if now is not None else float("inf"), stream_write_timeout()))
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -6852,7 +6899,8 @@ def make_handler(svc: Service):
         def _response_work(self, req, sampling, history, validation, owner, cancel, response_id=None, persist=True):
             sampling = dict(sampling)
             # Shared thinking defaults must be resolved by the same normalizer as request values.
-            messages, tools, kw = openai_to_messages(sampling, glm_dsa=getattr(svc.template, "glm_dsa", False))
+            messages, tools, kw = openai_to_messages(sampling, glm_dsa=getattr(svc.template, "glm_dsa", False),
+                                              tool_ids=getattr(svc.template, "inkling", False))
             max_new = int(sampling.get("max_completion_tokens") or sampling.get("max_tokens") or 0)
             events = None
             svc.embeddings.path = None
@@ -6885,7 +6933,8 @@ def make_handler(svc: Service):
             req = svc.with_shared(req, "openai")
             req["_api"] = "web" if req.get("strata_resume") is True else "openai"   # the Monitor's request table
             svc.check_request(req)                             # a bad sampling field or logit_bias: a 400, now
-            messages, tools, kw = openai_to_messages(req, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False))
+            messages, tools, kw = openai_to_messages(req, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False),
+                                              tool_ids=getattr(svc.template, "inkling", False))
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or []}
@@ -6994,7 +7043,8 @@ def make_handler(svc: Service):
             req = svc.with_shared(req, "anthropic")
             req["_api"] = "anthropic"
             svc.check_request(req)                             # a bad sampling field: a 400, now
-            messages, tools, kw = anthropic_to_messages(req, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False))
+            messages, tools, kw = anthropic_to_messages(req, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False),
+                                              tool_ids=getattr(svc.template, "inkling", False))
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(req))
             if kw.get("_prefill"):                             # a required tool call starts the answer
