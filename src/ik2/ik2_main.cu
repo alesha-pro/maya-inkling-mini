@@ -5307,17 +5307,20 @@ int main(int argc, char** argv) {
 
     if (getenv("IK2_SUFFIX") && n_gpu == 1 && g_fast_want && !drafter)
         suffix_window = std::min({std::max(0, atoi(getenv("IK2_SUFFIX"))), chunk, 128});
-    if (suffix_window >= 8) {
+    if (suffix_window < 8) suffix_window = 0;
+    // (IK2_FORCE_BLOCK, no drafter: the block path's conv records too, a window of kBlockMax)
+    const bool force_block_recs = getenv("IK2_FORCE_BLOCK") && !drafter;
+    if (suffix_window || force_block_recs) {
+        const int rows = std::max(suffix_window, force_block_recs ? kBlockMax : 0);
         for (auto& v : M.V) {
             const size_t cc[] = {KD, KD, C, C};
             for (int j = 0; j < 4; ++j) {
                 v.rec_old[j] = dalloc<float>(3 * cc[j]);
-                v.rec_x[j] = dalloc<float>((size_t)suffix_window * cc[j]);
+                v.rec_x[j] = dalloc<float>((size_t)rows * cc[j]);
             }
         }
-        std::printf("suffix verification: up to %d inputs per target forward\n", suffix_window);
-    } else
-        suffix_window = 0;
+        if (suffix_window) std::printf("suffix verification: up to %d inputs per target forward\n", suffix_window);
+    }
 
     // the work buffers and the expert cache, a set a GPU
     for (int d = 0; d < n_gpu; ++d) {
@@ -7216,7 +7219,25 @@ int main(int argc, char** argv) {
     int suffix_at = 0;
     SuffixStats suffix_stats;
     int next_placement = kPlacementInterval;
-    for (int i = 0, best = first_best; i < gen && !drafter; ++i) {
+    // IK2_FORCE_BLOCK=B (2 .. 8, with IK2_FORCE and IK2_LOGITS_OUT): the forced tokens through the block path - a
+    // drafter's verify window - B at a time, every row's logits written: that path's numerics on known text (all
+    // accepted, so no rollback), which --dump (the general path) does not reach.  bench/parity/run_gate.sh block mode.
+    const int force_block = getenv("IK2_FORCE_BLOCK") ? std::atoi(getenv("IK2_FORCE_BLOCK")) : 0;
+    if (force_block) {
+        if (force_block < 2 || force_block > kBlockMax || !lo || force.empty() || drafter || !g_fast || !g_block)
+            die("IK2_FORCE_BLOCK: 2 .. 8, with IK2_FORCE and IK2_LOGITS_OUT, resident, the block path on, no drafter");
+        if ((int) prompt.size() + (int) force.size() > ctx) die("IK2_FORCE_BLOCK: prompt + forced tokens past --ctx");
+        int P = (int) prompt.size();
+        for (size_t j = 0; j < force.size(); j += force_block) {
+            const int B = (int) std::min<size_t>(force_block, force.size() - j);
+            logits.clear();
+            fast_block(M, force.data() + j, B, P, OutMode::kLogits, logits, nullptr);
+            std::fwrite(logits.data(), sizeof(float), (size_t) B * c.n_vocab, lo);
+            P += B;
+        }
+        std::printf("forced block: %zu tokens through the block path, %d a window\n", force.size(), force_block);
+    }
+    for (int i = 0, best = first_best; i < gen && !drafter && !force_block; ++i) {
         if (g_managed_experts && i >= next_placement) {
             place_decode(M, (int)prompt.size() + i);
             next_placement = i + kPlacementInterval;
@@ -7256,7 +7277,7 @@ int main(int argc, char** argv) {
         }
     }
     if (lo) std::fclose(lo);
-    if (!force.empty())
+    if (!force.empty() && !force_block)
         std::printf("forced: %d tokens fed, the model's pick agreed with the next one %d times (%.2f%%)\n",
                     (int) std::min<size_t>(force.size(), out.size()), agree,
                     100.0 * agree / std::max<size_t>(1, std::min<size_t>(force.size(), out.size())));

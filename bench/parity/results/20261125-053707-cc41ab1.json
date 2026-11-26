@@ -1,0 +1,30 @@
+{
+ "summary": {
+  "positions": 2048,
+  "top1": 0.9775390625,
+  "top1_ci95": [
+   0.970171514395308,
+   0.9831185127330302
+  ],
+  "flips": 46,
+  "near_tie_flips": 39,
+  "real_flips": 7,
+  "kl_mean": 0.003068998995649641,
+  "kl_p99": 0.03428667275103523,
+  "kl_max": 0.17277039761925211,
+  "dlogp_max": 0.5585315227508545,
+  "ref_mass_min": 0.421890384652509
+ },
+ "limits": {
+  "min_positions": 1000,
+  "top1_min": 0.96,
+  "real_flips_max": 15,
+  "kl_mean_max": 0.006,
+  "kl_p99_max": 0.06,
+  "kl_max_max": 0.4,
+  "dlogp_max": 1.0
+ },
+ "pass": true,
+ "fails": [],
+ "layers": []
+}
