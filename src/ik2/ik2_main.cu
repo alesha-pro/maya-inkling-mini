@@ -25,6 +25,7 @@
 #include "ik2_cpu_deep.hpp"
 #include "ik2_draft.hpp"
 #include "ik2_kernels.cuh"
+#include "ik2_sample.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 
 #include <cublas_v2.h>
@@ -3237,46 +3238,12 @@ struct SampleCfg {   // temp <= 0: greedy
     int top_k = 0;
     std::mt19937_64* rng = nullptr;
 };
-// the serve loop's sampling distribution over candidates cd (logit, token): softmax(logit / temp) over the top_p
-// mass of the min(top_k, kCandK) largest (ties: the lower token first) - pick_top's - as (token, probability)
+// the serve loop's sampling distribution over candidates cd (logit, token) - ik2_sample.hpp's, over the kCandK largest
 std::vector<std::pair<int, double>> sample_dist(std::vector<std::pair<float, int>>& cd, const SampleCfg& sc) {
-    const int kk = std::min((int) cd.size(), sc.top_k > 0 ? std::min(sc.top_k, kCandK) : kCandK);
-    std::partial_sort(cd.begin(), cd.begin() + kk, cd.end(),
-                      [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
-                          return a.first > b.first || (a.first == b.first && a.second < b.second);
-                      });
-    std::vector<double> pr(kk);
-    double z = 0;
-    for (int j = 0; j < kk; ++j) z += (pr[j] = std::exp((cd[j].first - cd[0].first) / sc.temp));
-    double acc = 0;
-    int keep = kk;
-    for (int j = 0; j < kk; ++j) {
-        acc += pr[j] / z;
-        if (acc >= sc.top_p) {
-            keep = j + 1;
-            break;
-        }
-    }
-    double zk = 0;
-    for (int j = 0; j < keep; ++j) zk += pr[j];
-    std::vector<std::pair<int, double>> out(keep);
-    for (int j = 0; j < keep; ++j) out[j] = {cd[j].second, pr[j] / zk};
-    return out;
+    return ik2::sample::dist(cd, sc.temp, sc.top_p, sc.top_k, kCandK);
 }
 int sample_from(const std::vector<std::pair<int, double>>& d, std::mt19937_64& rng, int skip = -1) {
-    double z = 0;
-    for (const auto& e : d)
-        if (e.first != skip) z += e.second;
-    if (z <= 0) return d[0].first;
-    double u = std::uniform_real_distribution<double>(0, z)(rng);
-    for (const auto& e : d) {
-        if (e.first == skip) continue;
-        u -= e.second;
-        if (u <= 0) return e.first;
-    }
-    for (auto it = d.rbegin(); it != d.rend(); ++it)
-        if (it->first != skip) return it->first;
-    return d[0].first;
+    return ik2::sample::draw(d, rng, skip);
 }
 
 // When to draft and how wide (IK2_DRAFT_WIDTH the widest; IK2_DRAFT_ADAPT=0: always that wide): a step's expected
@@ -3365,15 +3332,9 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
                 next.push_back(sample_from(dist, *sc.rng));
                 break;
             }
-            double pd = 0;
-            for (const auto& e : dist)
-                if (e.first == dr[j]) pd = e.second;
-            if (std::uniform_real_distribution<double>(0, 1)(*sc.rng) < pd) {
-                next.push_back(dr[j]);
-            } else {
-                next.push_back(sample_from(dist, *sc.rng, dr[j]));
-                break;
-            }
+            bool kept = false;
+            next.push_back(ik2::sample::verify_draft(dist, dr[j], *sc.rng, &kept));
+            if (!kept) break;
         }
     }
     for (size_t j = 0; j + 1 < next.size(); ++j)   // (a stop among the accepted: it is the last)
@@ -5842,31 +5803,7 @@ int main(int argc, char** argv) {
         };
 
         auto pick_top_r = [&](std::vector<std::pair<float, int>>& cd, Req& r) -> int {
-            const int kk = std::min((int) cd.size(), r.top_k > 0 ? std::min(r.top_k, kCandK) : kCandK);
-            std::partial_sort(cd.begin(), cd.begin() + kk, cd.end(),
-                              [](const std::pair<float, int>& a2, const std::pair<float, int>& b2) {
-                                  return a2.first > b2.first || (a2.first == b2.first && a2.second < b2.second);
-                              });
-            std::vector<double> pr(kk);
-            double z = 0;
-            for (int j = 0; j < kk; ++j) z += (pr[j] = std::exp((cd[j].first - cd[0].first) / r.temp));
-            double acc = 0;
-            int keep = kk;
-            for (int j = 0; j < kk; ++j) {
-                acc += pr[j] / z;
-                if (acc >= r.top_p) {
-                    keep = j + 1;
-                    break;
-                }
-            }
-            double zk = 0;
-            for (int j = 0; j < keep; ++j) zk += pr[j];
-            double u = std::uniform_real_distribution<double>(0, zk)(r.rng);
-            for (int j = 0; j < keep; ++j) {
-                u -= pr[j];
-                if (u <= 0) return cd[j].second;
-            }
-            return cd[keep - 1].second;
+            return ik2::sample::pick(cd, r.temp, r.top_p, r.top_k, kCandK, r.rng);
         };
         auto pick_row = [&](const float* row, Req& r) -> int {
             if (r.temp <= 0) return (int) (std::max_element(row, row + c.n_vocab) - row);
@@ -6953,31 +6890,7 @@ int main(int argc, char** argv) {
             // whole vocabulary, or the candidates the resident token path found on the device: every logit of the
             // highest bins that hold 1000 - the same 1000 either way; ties: the lower token first)
             auto pick_top = [&](std::vector<std::pair<float, int>>& cd) -> int {
-                const int kk = std::min((int) cd.size(), top_k > 0 ? std::min(top_k, kCandK) : kCandK);
-                std::partial_sort(cd.begin(), cd.begin() + kk, cd.end(),
-                                  [](const std::pair<float, int>& a2, const std::pair<float, int>& b2) {
-                                      return a2.first > b2.first || (a2.first == b2.first && a2.second < b2.second);
-                                  });
-                std::vector<double> pr(kk);
-                double z = 0;
-                for (int j = 0; j < kk; ++j) z += (pr[j] = std::exp((cd[j].first - cd[0].first) / temp));
-                double acc = 0;
-                int keep = kk;
-                for (int j = 0; j < kk; ++j) {
-                    acc += pr[j] / z;
-                    if (acc >= top_p) {
-                        keep = j + 1;
-                        break;
-                    }
-                }
-                double zk = 0;
-                for (int j = 0; j < keep; ++j) zk += pr[j];
-                double u = std::uniform_real_distribution<double>(0, zk)(rng);
-                for (int j = 0; j < keep; ++j) {
-                    u -= pr[j];
-                    if (u <= 0) return cd[j].second;
-                }
-                return cd[keep - 1].second;
+                return ik2::sample::pick(cd, temp, top_p, top_k, kCandK, rng);
             };
             auto pick = [&](const float* r) -> int {
                 if (temp <= 0) return (int) (std::max_element(r, r + c.n_vocab) - r);
