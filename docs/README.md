@@ -7,6 +7,7 @@ Every page in this folder, by what you want to do. Back to the [README](../READM
 - [SETUP.md](SETUP.md): what the first run does, starting again and updating, the setup's options, and the fix for each build failure.
 - [MODELS.md](MODELS.md): the five models, how the quants are named, and each one's files, drafters, pictures and options.
 - [GLM53.md](GLM53.md): GLM-5.3 (744B): its files, setup, context and defaults.
+- [INKLING2-MINI.md](INKLING2-MINI.md): Inkling 2 Mini on one 24 GB card (or 8 GB with `ik2-mini-8gb.json`): building `maya-ik2`, the model's files, the configs in [`inkling2-mini/`](inkling2-mini/), speeds and quality.
 - [MEMORY.md](MEMORY.md): which model fits your PC - each model's recommended memory (VRAM + RAM together).
 - [WINDOWS.md](WINDOWS.md): installing and running Maya on Windows 10/11.
 
@@ -36,6 +37,7 @@ Every page in this folder, by what you want to do. Back to the [README](../READM
 
 How the engine works and how changes were measured. You do not need these to run Maya.
 
+- [INKLING2.md](INKLING2.md): the specification `maya-ik2` started from (written for Inkling-2-Small): the model exactly, the GGUF it reads, the reference forward, and how the engine computes each part.
 - [GLM5-FLASH.md](GLM5-FLASH.md): the study of what it takes to run GLM-5.3-Flash on the engine, component by component.
 - [QUANT-PLAN.md](QUANT-PLAN.md): the plan for Maya's first GLM-5.3-Flash quants.
 - [GLM_MMQ_CORRECTNESS.md](GLM_MMQ_CORRECTNESS.md): the incoherent GLM prefill replies on Windows with CUDA 13.2.

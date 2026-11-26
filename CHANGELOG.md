@@ -4,6 +4,25 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## Unreleased - Inkling 2 Mini (this repository, after v1.1.70)
+
+Inkling-2-Mini (26B MoE) on `maya-ik2`, the Inkling 2 engine: one 24 GB card with every expert in VRAM, or an 8 GB
+card with a cache of them; the official drafter; pictures through `maya-vision`. The guide is
+[docs/INKLING2-MINI.md](docs/INKLING2-MINI.md), the configs are in `docs/inkling2-mini/`.
+
+- **Inkling 2 Mini on one RTX 3090:** the README, the guide and the server configs (262K with the drafter, 344K
+  without, text only, GPU vision). A token is 757 kernel launches replayed as one CUDA graph.
+- **Speculative decoding with the official drafter:** the window verified on the block path; greedy keeps the
+  agreeing drafts, sampling stays exact; a controller turns it on where it pays.
+- **An 8 GB card (#4):** the experts in pinned host memory, a cache of them in VRAM, the CPU computing the misses
+  (AVX-512): 40 to 43 tok/s on an RTX 5070 Laptop.
+- **`--parallel N` continuous batching (#5):** up to 8 requests at once on one GPU, a paged global KV pool shared by
+  the slots; batched decode matches solo decode (KL ~3e-8 a row).
+- **Conversations kept in host RAM (#11, `IK2_SLOT_KEEP`):** a conversation another request displaces comes back in a
+  copy instead of a new prefill.
+- **Windows (#3, #10) and AMD (#7):** MSVC hardening and `serve_multi` on Windows; the HIP build compiles and links
+  `maya-ik2`.
+
 ## v1.1.70 - 2026-11-20
 
 Hy4-Flash decodes faster where the CPU computes experts (small cards, one GPU with a big model, and tensor parallel
