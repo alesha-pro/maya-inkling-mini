@@ -1,0 +1,15 @@
+maya-ik2: 24 layers (20 sliding), 128 experts (8 a token), width 2304, vocab 200058; 1 shards
+looped: layers 6 .. 17 run 3 times - 48 layer visits a token; message gates of rank 64
+experts 14.7 GiB, dense weights 1.1 GiB as blocks, K / V cache 0.9 GiB, 22.5 GiB free: every expert stays in VRAM
+layout: unsloth's GGUF_shard_rewrite (llama.cpp master)
+kv cache: FP8 E4M3 (0.89 GiB across 48 layer visits)
+dense weights in VRAM: 0.6 s; GPU 0: 20.2 GiB of 23.6 free
+experts: read where the files are mapped (IK2_HOST=mmap)
+expert cache, GPU 0: 3072 slots across 2 pools (14.7 GiB); load 0.9 s in all
+  pool 0: 2560 slots of 4.3 MiB (10.7 GiB, 20 layers)
+  pool 1: 512 slots of 8.1 MiB (4.0 GiB, 4 layers)
+resident: every expert in VRAM (3072 copied in 2.2 s); tokens take the resident path, a CUDA graph each
+prompt: 16384 tokens in 5.33 s (3074.4 tok/s); experts 0.70 s of it, uploads 0.00 s; cache 23651 hits, 0 misses, 0.0 GiB copied
+13,220,15,13,20,196990,220,16
+generation: 7 tokens in 0.06 s (107.91 tok/s); cache 0 hits, 0 misses in it
+generated: 13 220 15 13 20 196990 220 16
