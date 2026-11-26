@@ -4702,8 +4702,18 @@ int main(int argc, char** argv) {
     for (auto& e : g_ring) CU(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     // (off by default: on an RTX PRO 6000 node's Xeon 6737P an NVFP4 expert takes 0.73 ms on 7 threads against 0.33 ms
     //  over PCIe, and the lane measured 16.4 against 16.8 tok/s - IK2_CPU=1 to try it)
-    if (getenv("IK2_CPU") && std::atoi(getenv("IK2_CPU")) && ik2::cpu::available() && threads > 1 && n_gpu == 1)
-        g_pool = new ik2::cpu::Pool(threads - 1);
+    if (getenv("IK2_CPU") && std::atoi(getenv("IK2_CPU"))) {
+        // (the lane's kernels are AVX-512: without it, or with one thread or two GPUs, every missing expert is copied
+        //  over PCIe - said, since ik2-mini-8gb.json's speed rests on the lane)
+        const char* why = !ik2::cpu::available() ? "this CPU has no AVX-512 (avx512f and avx512bw)"
+                          : threads <= 1       ? "--threads 1"
+                          : n_gpu != 1         ? "more than one GPU"
+                                               : nullptr;
+        if (why)
+            std::fprintf(stderr, "maya-ik2: IK2_CPU=1 ignored: %s - every missing expert is copied to the GPU\n", why);
+        else
+            g_pool = new ik2::cpu::Pool(threads - 1);
+    }
     if (getenv("IK2_CPU_Q8")) g_cpu_q8 = std::atoi(getenv("IK2_CPU_Q8")) != 0;
     if (getenv("IK2_UP_MS")) g_t_up = std::atof(getenv("IK2_UP_MS")) * 1e-3;
     g_cpu_lazy = !getenv("IK2_CPU_LAZY") || std::atoi(getenv("IK2_CPU_LAZY"));
