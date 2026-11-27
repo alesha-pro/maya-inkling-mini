@@ -951,9 +951,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(ik2_kernels_test PRIVATE include)
     # P3-4's speed gate: the grouped NVFP4 expert GEMM timed and dumped at the model's shapes, both paths
     # (IK2_GROUP_MMA=3 with IK2_EXPERT_WMMA=0 / 1) from this one binary.
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/ik2_expert_bench.cu)   # the bench source is not in the repo
     add_executable(ik2_expert_bench tests/ik2_expert_bench.cu)
     target_link_libraries(ik2_expert_bench PRIVATE ik2_kernels)
     target_include_directories(ik2_expert_bench PRIVATE include)
+    endif()
   endif()
   if((STRATA_ENABLE_CUDA AND (_mm3_archs OR NOT _mm3_filter)) OR STRATA_ENABLE_HIP)
     # (a GGUF's weights - tools/mm3/pack_gguf.py, MiniMax's Maya quants: maya-ds4's ggml block-type kernels, src/ds4/ds4_iq,
